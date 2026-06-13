@@ -944,6 +944,45 @@ impl AccountCache {
                 continue;
             }
 
+            // Static read accounts (global configs, authority PDAs) that rarely change.
+            // Fetch once from RPC and persist as a manual cached copy. Unlike
+            // needs_grpc_live_state, these do not need a live Yellowstone subscription.
+            if row.severity == "needs_manual_static_or_synthetic" {
+                let fetch = self.get_many_or_fetch(&[pubkey]);
+                let status = describe_fetch_result(fetch.get(&pubkey));
+                let mut persisted = false;
+                if let Some(AccountFetchResult::Found(account)) = fetch.get(&pubkey) {
+                    let class = classify_tx_static_account(account);
+                    if can_persist_tx_static_data(class) {
+                        if let Err(e) = persist_problem_manual_account(output_root, pubkey, account) {
+                            eprintln!(
+                                "[problem_account_static_persist_error] pubkey={} error={}",
+                                pubkey, e
+                            );
+                        } else {
+                            persisted = true;
+                        }
+                    }
+                }
+                stats.manual_loaded += 1;
+                upsert_load_line(
+                    &mut load_map,
+                    &pubkey,
+                    format!(
+                        "unix={} pubkey={} action=static_rpc_loaded fetch={} persisted={} severity={} classification={} pool={} role={} dex={}",
+                        now, pubkey, status, persisted,
+                        row.severity, row.classification,
+                        empty_dash(&row.pool), empty_dash(&row.role), empty_dash(&row.dex)
+                    ),
+                );
+                eprintln!(
+                    "[problem_account_promoted] pubkey={} action=static_manual fetch={} persisted={} pool={} role={} dex={}",
+                    pubkey, status, persisted,
+                    empty_dash(&row.pool), empty_dash(&row.role), empty_dash(&row.dex)
+                );
+                continue;
+            }
+
             if row.severity == "needs_manual_check" {
                 let fetch = self.get_many_or_fetch(&[pubkey]);
                 let status = describe_fetch_result(fetch.get(&pubkey));
