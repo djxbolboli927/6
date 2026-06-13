@@ -1147,6 +1147,15 @@ impl Simulator {
         let mut missing = 0usize;
         let mut rpc_errors = 0usize;
 
+        // For AlphaQ retries, compute the route accounts so we can block
+        // synthetic re-injection for accounts that are confirmed NotFound on RPC.
+        // Re-injecting a synthetic would repeat the same InvalidAccountOwner error.
+        let retry_alphaq_route_accounts = if *failed_program == ALPHAQ_PROGRAM_ID {
+            jupiter_route_account_keys_for_program(tx, alts, &ALPHAQ_PROGRAM_ID)
+        } else {
+            HashSet::new()
+        };
+
         for alt in alts {
             match synthetic_alt_account(alt).and_then(|raw| {
                 svm.set_account(pk_to_addr(alt.key), raw)
@@ -1218,7 +1227,33 @@ impl Simulator {
                     }
                 }
                 Some(AccountFetchResult::NotFound) | None => {
-                    if synthetic_readonly_system_accounts.contains(pk) {
+                    // AlphaQ route accounts that were synthetic in the initial sim must NOT be
+                    // re-injected as synthetic in the retry. If the account is also NotFound on
+                    // RPC it doesn't exist on-chain → the trade will fail on-chain too → count
+                    // as missing so the retry aborts cleanly instead of repeating InvalidAccountOwner.
+                    if !retry_alphaq_route_accounts.is_empty()
+                        && retry_alphaq_route_accounts.contains(pk)
+                        && synthetic_readonly_system_accounts.contains(pk)
+                        && !is_expected_readonly_pda_authority_meta(meta)
+                    {
+                        missing += 1;
+                        eprintln!(
+                            "[sim_retry_alphaq_account_notfound_rpc] route_sig={:032x} source={} pk={} action=count_as_missing reason=alphaq_account_not_on_rpc_synthetic_would_repeat_invalid_owner",
+                            route_sig, ix_source, pk
+                        );
+                        if let Some(handle) = &self.missing_handle {
+                            handle.record(crate::auto_missing_accounts::MissingAccountEvent {
+                                pubkey: *pk,
+                                route_sig,
+                                route_labels: route_labels.to_string(),
+                                programs: route_programs.to_string(),
+                                source: "retry_alphaq_notfound_rpc".to_string(),
+                                is_signer: meta.is_signer,
+                                is_writable: meta.is_writable,
+                                created_by_setup: false,
+                            });
+                        }
+                    } else if synthetic_readonly_system_accounts.contains(pk) {
                         let expected_pda_authority = is_expected_readonly_pda_authority_meta(meta);
 
                         if expected_pda_authority {
@@ -1579,33 +1614,6 @@ impl Simulator {
             let fetch_result = fetched_accounts.get(pk);
 
             if fetch_result.is_none() && missing_without_rpc.contains(pk) {
-                // AlphaQ (Whirlpool fork) enforces owner checks on every account in its
-                // instruction. Injecting a synthetic System-owned placeholder causes
-                // InvalidAccountOwner. Block the simulation now and let auto_missing fetch
-                // the real account so the next attempt uses correct on-chain data.
-                if contains_alphaq
-                    && alphaq_route_accounts.contains(pk)
-                    && !is_expected_readonly_pda_authority_meta(meta)
-                {
-                    eprintln!(
-                        "[sim_alphaq_route_account_blocked] pk={} source={} is_writable={} action=add_to_missing reason=alphaq_ownership_check_would_fail_with_synthetic",
-                        pk, meta.source.as_str(), meta.is_writable
-                    );
-                    if let Some(handle) = &self.missing_handle {
-                        handle.record(crate::auto_missing_accounts::MissingAccountEvent {
-                            pubkey: *pk,
-                            route_sig,
-                            route_labels: route_labels.to_string(),
-                            programs: route_programs.to_string(),
-                            source: "alphaq_route_account_not_in_cache".to_string(),
-                            is_signer: meta.is_signer,
-                            is_writable: meta.is_writable,
-                            created_by_setup: false,
-                        });
-                    }
-                    missing_accounts.push(*meta);
-                    continue;
-                }
                 if should_allow_synthetic_missing(meta, disable_synthetic_for_all_alphaq_accounts) {
                     eprintln!(
                         "[sim_synthetic_readonly_system] pk={} reason=hot_path_rpc_disabled_readonly_non_signer is_writable={} source={}",
@@ -1635,6 +1643,12 @@ impl Simulator {
                             is_writable: meta.is_writable,
                             created_by_setup: false,
                         });
+                    }
+                    if contains_alphaq && alphaq_route_accounts.contains(pk) {
+                        eprintln!(
+                            "[sim_alphaq_synthetic_candidate] pk={} source={} note=alphaq_may_check_owner_of_this_account_and_fail",
+                            pk, meta.source.as_str()
+                        );
                     }
                 } else {
                     if contains_alphaq && alphaq_route_accounts.contains(pk) {
