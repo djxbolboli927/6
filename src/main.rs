@@ -496,20 +496,113 @@ async fn wait_for_live_cache_ready(
         }
 
         if Instant::now() >= deadline {
+            // Before failing, do a final RPC check to distinguish accounts that
+            // genuinely exist on-chain (Yellowstone lag → real error) from
+            // accounts that don't exist at all (closed/inactive pools → safe to
+            // skip).  pools_by_dex/*.json may reference vaults that were closed
+            // since the file was generated; those should never block startup.
+            let still_missing_after_rpc = {
+                let rpc = cache.rpc_client();
+                let chunk_size = 100;
+                let mut still_missing = Vec::new();
+                let mut not_found_on_rpc = 0usize;
+                for chunk in missing.chunks(chunk_size) {
+                    match rpc.get_multiple_accounts(chunk) {
+                        Ok(results) => {
+                            for (pk, maybe_acct) in chunk.iter().zip(results.into_iter()) {
+                                match maybe_acct {
+                                    Some(acct) => {
+                                        // Account exists on-chain but Yellowstone hasn't
+                                        // delivered it yet — this is a real readiness problem.
+                                        let account = account_cache::rpc_account_to_cache_account(acct);
+                                        cache.insert_manual(*pk, account);
+                                        // Now it's in cache; don't count as missing.
+                                    }
+                                    None => {
+                                        // Account doesn't exist on-chain; will never arrive
+                                        // from Yellowstone.  Log and skip.
+                                        eprintln!(
+                                            "[grpc_live_cache_skip_notfound] pk={} reason=account_not_on_chain",
+                                            pk
+                                        );
+                                        not_found_on_rpc += 1;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // RPC error: can't distinguish; treat as still missing.
+                            for pk in chunk {
+                                still_missing.push(*pk);
+                            }
+                            eprintln!("[grpc_live_cache_rpc_check_error] error={e}");
+                        }
+                    }
+                }
+                // Re-check after the RPC top-up.
+                let remaining: Vec<Pubkey> = targets
+                    .iter()
+                    .copied()
+                    .filter(|pk| cache.get(pk).is_none())
+                    .filter(|pk| still_missing.contains(pk))
+                    .collect();
+                eprintln!(
+                    "[grpc_live_cache_ready_rpc_check] missing_before={} not_found_on_rpc={} rpc_errors={} still_missing={}",
+                    missing.len(),
+                    not_found_on_rpc,
+                    missing.len().saturating_sub(not_found_on_rpc + remaining.len()),
+                    remaining.len()
+                );
+                remaining
+            };
+
+            // Re-count after the RPC top-up.
+            let final_missing: Vec<Pubkey> = targets
+                .iter()
+                .copied()
+                .filter(|pk| cache.get(pk).is_none())
+                .collect();
+
+            if final_missing.is_empty() {
+                eprintln!(
+                    "[grpc_live_cache_ready] true live_accounts_ready={} live_accounts_total={} missing_live_accounts=0 valid_pools_ready={} invalid_pools={} note=resolved_by_rpc_topup",
+                    targets.len(),
+                    targets.len(),
+                    mix_registry.map(|registry| registry.valid_pool_count()).unwrap_or(0),
+                    mix_registry
+                        .map(|registry| registry.invalid_pool_count() + registry.unverified_pool_count())
+                        .unwrap_or(0)
+                );
+                return Ok(());
+            }
+
+            // If accounts still missing are only because of RPC errors (not
+            // confirmed on-chain), treat it as a soft warning and continue.
+            if still_missing_after_rpc.is_empty() {
+                // All were NotFound on RPC — safe to proceed.
+                eprintln!(
+                    "[grpc_live_cache_ready] true live_accounts_ready={} live_accounts_total={} missing_live_accounts={} note=all_missing_are_not_found_on_chain",
+                    targets.len().saturating_sub(final_missing.len()),
+                    targets.len(),
+                    final_missing.len(),
+                );
+                return Ok(());
+            }
+
             let sample = crate::mix_registry::pubkeys_json(
-                &missing.iter().copied().take(20).collect::<Vec<_>>(),
+                &final_missing.iter().copied().take(20).collect::<Vec<_>>(),
             );
             eprintln!(
                 "[grpc_live_cache_ready] false live_accounts_ready={} live_accounts_total={} missing_live_accounts={} sample={}",
-                targets.len().saturating_sub(missing.len()),
+                targets.len().saturating_sub(final_missing.len()),
                 targets.len(),
-                missing.len(),
+                final_missing.len(),
                 sample
             );
             bail!(
                 "live account cache is not ready after {}s; missing={} sample={}",
                 timeout.as_secs(),
-                missing.len(),
+                final_missing.len(),
                 sample
             );
         }

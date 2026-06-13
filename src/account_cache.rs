@@ -284,6 +284,11 @@ impl AccountCache {
         );
     }
 
+    /// Access the primary RPC client (e.g. for a final on-chain check at startup).
+    pub fn rpc_client(&self) -> Arc<RpcClient> {
+        self.rpc.clone()
+    }
+
     /// Fast path: read from the hot cache. Returns None if not yet populated.
     #[inline]
     pub fn get(&self, pubkey: &Pubkey) -> Option<Account> {
@@ -1478,7 +1483,7 @@ fn can_load_tx_static_classification(classification: &str) -> bool {
     can_persist_tx_static_data(classification)
 }
 
-fn rpc_account_to_cache_account(acct: solana_sdk::account::Account) -> Account {
+pub fn rpc_account_to_cache_account(acct: solana_sdk::account::Account) -> Account {
     Account {
         lamports: acct.lamports,
         data: acct.data,
