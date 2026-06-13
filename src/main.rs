@@ -289,6 +289,21 @@ async fn async_main(config: config::Config) -> Result<()> {
             sim_prefetch_groups = registry.filter_valid_groups(&sim_prefetch_groups);
         }
 
+        // Merge fixed-pool vaults from pools_by_dex/*.json AFTER mix_registry
+        // filtering so they are never removed. Token-program-owned vaults are NOT
+        // covered by the Yellowstone owner-filter and must be subscribed
+        // individually; without this they get a synthetic SystemProgram-owned
+        // placeholder which causes AlphaQ (and others) to fail with
+        // InvalidAccountOwner.
+        let fixed_pools = dex_accounts::load_pools_by_dex_dir("pools_by_dex");
+        sim_all_accounts.extend_from_slice(&fixed_pools.all_accounts);
+        sim_all_accounts.sort_unstable();
+        sim_all_accounts.dedup();
+        sim_subscribe_accounts.extend_from_slice(&fixed_pools.subscribe_accounts);
+        sim_subscribe_accounts.sort_unstable();
+        sim_subscribe_accounts.dedup();
+        sim_prefetch_groups.extend(fixed_pools.prefetch_groups);
+
         let mut live_extra = vec![wsol_ata];
         live_extra.extend_from_slice(&sim_subscribe_accounts);
         for s in SIM_STATIC_EXTRA_ACCOUNTS {

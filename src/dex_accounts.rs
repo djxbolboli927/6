@@ -262,6 +262,156 @@ fn collect_prefetch_groups_from_mix(value: &serde_json::Value) -> Vec<Vec<Pubkey
     collect_pool_like_groups(root)
 }
 
+/// Load pool vault accounts from `pools_by_dex/*.json` files.
+///
+/// Each JSON file contains an array of pool entries:
+/// ```json
+/// [{ "pubkey": "POOL", "params": { "tokenAccountA": "VA", "tokenAccountB": "VB", ... } }]
+/// ```
+///
+/// Pool state (`pubkey`) is owned by the DEX program and therefore covered
+/// by the Yellowstone owner-filter.  The vaults (`tokenAccountA`,
+/// `tokenAccountB`) are owned by SPL Token and are NOT in the owner-filter:
+/// they must be subscribed individually so the sim cache stays current.
+///
+/// This is the same contract as the TOML pool files under `dex_dir/`, but
+/// the JSON format is richer (produced by the pool scraper) and covers all
+/// 713 fixed pools across every supported DEX.
+pub fn load_pools_by_dex_dir(pools_dir: &str) -> DexPools {
+    let dir_path = std::path::Path::new(pools_dir);
+    if !dir_path.exists() {
+        return DexPools {
+            all_accounts: vec![],
+            subscribe_accounts: vec![],
+            prefetch_groups: vec![],
+        };
+    }
+
+    let entries = match std::fs::read_dir(dir_path) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(pools_dir, error = %e, "cannot read pools_by_dex dir");
+            return DexPools {
+                all_accounts: vec![],
+                subscribe_accounts: vec![],
+                prefetch_groups: vec![],
+            };
+        }
+    };
+
+    let mut all: Vec<Pubkey> = Vec::new();
+    let mut subs: Vec<Pubkey> = Vec::new();
+    let mut prefetch_groups: Vec<Vec<Pubkey>> = Vec::new();
+    let mut total_pools = 0usize;
+
+    for dir_entry in entries.flatten() {
+        let path = dir_entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let fname = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?")
+            .to_string();
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(file = %fname, error = %e, "cannot read pools_by_dex json");
+                continue;
+            }
+        };
+
+        let pool_list: Vec<serde_json::Value> = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(file = %fname, error = %e, "invalid pools_by_dex json");
+                continue;
+            }
+        };
+
+        let mut file_pools = 0usize;
+
+        for pool_json in &pool_list {
+            let pool_pk_str = pool_json
+                .get("pubkey")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let params = pool_json.get("params");
+
+            let vault_a = params
+                .and_then(|p| p.get("tokenAccountA"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let vault_b = params
+                .and_then(|p| p.get("tokenAccountB"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let mint_a = params
+                .and_then(|p| p.get("tokenmentA"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let mint_b = params
+                .and_then(|p| p.get("tokenmentB"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let mut group: Vec<Pubkey> = Vec::new();
+
+            let mut push_addr = |s: &str, is_vault: bool| {
+                if s.is_empty() {
+                    return;
+                }
+                if let Ok(pk) = Pubkey::try_from(s) {
+                    all.push(pk);
+                    group.push(pk);
+                    if is_vault {
+                        subs.push(pk);
+                    }
+                }
+            };
+
+            // Pool state — owned by DEX program, covered by Yellowstone owner-filter.
+            push_addr(pool_pk_str, false);
+            // Vaults — owned by SPL Token, NOT in owner-filter → individual subscription.
+            push_addr(vault_a, true);
+            push_addr(vault_b, true);
+            // Mints — static, rarely change.
+            push_addr(mint_a, false);
+            push_addr(mint_b, false);
+
+            if !group.is_empty() {
+                group.sort_unstable();
+                group.dedup();
+                prefetch_groups.push(group);
+                file_pools += 1;
+                total_pools += 1;
+            }
+        }
+
+        info!(file = %fname, pools = file_pools, "pools_by_dex file loaded");
+    }
+
+    all.sort_unstable();
+    all.dedup();
+    subs.sort_unstable();
+    subs.dedup();
+
+    info!(
+        pools = total_pools,
+        prefetch = all.len(),
+        live_subs = subs.len(),
+        "pools_by_dex registry loaded"
+    );
+
+    DexPools {
+        all_accounts: all,
+        subscribe_accounts: subs,
+        prefetch_groups,
+    }
+}
+
 fn collect_pool_like_groups(value: &serde_json::Value) -> Vec<Vec<Pubkey>> {
     let mut own = Vec::new();
     collect_pubkeys_from_json(value, &mut own);
