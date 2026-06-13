@@ -289,12 +289,18 @@ async fn async_main(config: config::Config) -> Result<()> {
             sim_prefetch_groups = registry.filter_valid_groups(&sim_prefetch_groups);
         }
 
-        // Merge fixed-pool vaults from pools_by_dex/*.json AFTER mix_registry
-        // filtering so they are never removed. Token-program-owned vaults are NOT
-        // covered by the Yellowstone owner-filter and must be subscribed
-        // individually; without this they get a synthetic SystemProgram-owned
-        // placeholder which causes AlphaQ (and others) to fail with
-        // InvalidAccountOwner.
+        // Load ALL pool accounts from pools_by_dex/*.json as the authoritative
+        // source for the 713+ fixed pools.  This is done AFTER mix_registry
+        // filtering so these accounts are never removed.
+        //
+        // Classification inside load_pools_by_dex_dir:
+        //   - tokenAccountA/B + DEX-specific volatile state → subscribe (Yellowstone)
+        //   - mints, authority PDAs                         → prefetch (RPC only)
+        //   - addressLookupTableAddress                     → alt_accounts (AltCache)
+        //
+        // This replaces the old approach of only loading vaults A/B: every
+        // DEX-specific writable account (oracle, observationState, globalVault,
+        // tickmap, etc.) is now also subscribed so the sim cache stays current.
         let fixed_pools = dex_accounts::load_pools_by_dex_dir("pools_by_dex");
         sim_all_accounts.extend_from_slice(&fixed_pools.all_accounts);
         sim_all_accounts.sort_unstable();
@@ -303,6 +309,22 @@ async fn async_main(config: config::Config) -> Result<()> {
         sim_subscribe_accounts.sort_unstable();
         sim_subscribe_accounts.dedup();
         sim_prefetch_groups.extend(fixed_pools.prefetch_groups);
+
+        // Pre-load ALT contents for every addressLookupTableAddress in pools_by_dex
+        // so v0 transactions that reference them can be resolved by the simulator.
+        if !fixed_pools.alt_accounts.is_empty() {
+            eprintln!(
+                "[pools_by_dex_alts] loading {} ALTs into alt_cache",
+                fixed_pools.alt_accounts.len()
+            );
+            alt_cache
+                .prefetch_missing_rate_limited(
+                    &fixed_pools.alt_accounts,
+                    rpc_client.clone(),
+                    config.simulation.prefetch_pools_per_second,
+                )
+                .await;
+        }
 
         let mut live_extra = vec![wsol_ata];
         live_extra.extend_from_slice(&sim_subscribe_accounts);
