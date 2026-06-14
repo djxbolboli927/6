@@ -102,6 +102,8 @@ pub struct SimulationResult {
     pub route_labels: String,
     /// true if simulation ran successfully for all hops.
     pub success: bool,
+    /// true if the simulation was actually executed (not just classified).
+    pub executed: bool,
     /// Phase 2: actual output amount from LiteSVM execution.
     pub final_out_amount: Option<u64>,
     /// Phase 2: profit as determined by simulation.
@@ -200,6 +202,7 @@ pub fn simulate_stub(req: &SimulationRequest) -> SimulationResult {
         route_sig: req.route_sig,
         route_labels: req.route_labels.clone(),
         success: unsupported.is_empty(),
+        executed: false,
         final_out_amount: None,
         simulated_profit: None,
         difference_vs_metis_quote: None,
@@ -247,55 +250,93 @@ pub async fn simulate(
 ) -> SimulationResult {
     let mut result = simulate_stub(req);
 
-    // Only attempt pmm-sim for pure PropAMM routes.
-    if result.sim_kind != "prop_amm_pmm_sim" {
-        return result;
+    // Gather ALL instructions for full transaction simulation.
+    let mut all_ixs: Vec<&crate::metis::InstructionData> = Vec::new();
+    for ix in &req.instructions.compute_budget_instructions {
+        all_ixs.push(ix);
+    }
+    for ix in &req.instructions.setup_instructions {
+        all_ixs.push(ix);
+    }
+    all_ixs.push(&req.instructions.swap_instruction);
+    if let Some(ix) = &req.instructions.cleanup_instruction {
+        all_ixs.push(ix);
     }
 
-    let t = std::time::Instant::now();
-    let id = SIM_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let ipc_instructions: Vec<crate::pmm_sim::IpcInstruction> = all_ixs.iter().map(|ix| {
+        crate::pmm_sim::IpcInstruction {
+            program_id: ix.program_id.clone(),
+            accounts: ix.accounts.iter().map(|a| crate::pmm_sim::IpcAccountMeta {
+                pubkey: a.pubkey.clone(),
+                is_signer: a.is_signer,
+                is_writable: a.is_writable,
+            }).collect(),
+            data: ix.data.clone(),
+        }
+    }).collect();
 
+    let accounts = crate::pmm_sim::collect_all_instruction_accounts(&all_ixs, cache);
     let token_mints = extract_route_mints(&req.merged_quote.route_plan);
     let src_mint = req.merged_quote.input_mint.clone();
     let src_amount: u64 = req.merged_quote.in_amount.parse().unwrap_or(0);
+    let id = SIM_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let ipc_req = crate::pmm_sim::build_sim_request(
-        id,
-        fee_payer,
-        &req.instructions.swap_instruction,
-        token_mints,
-        &src_mint,
-        src_amount,
-        cache,
+    let cache_hits = accounts.len();
+    eprintln!(
+        "[sim_start] route_sig={:032x} ix_count={} account_hits={}",
+        req.route_sig, all_ixs.len(), cache_hits,
     );
 
+    let ipc_req = crate::pmm_sim::FullSimRequest {
+        id,
+        fee_payer: fee_payer.to_string(),
+        src_mint,
+        src_amount,
+        token_mints,
+        instructions: ipc_instructions,
+        lookup_tables: vec![],
+        accounts,
+        jito_tip_lamports: 1600,
+        cu_limit: 1_400_000,
+        route_sig: format!("{:032x}", req.route_sig),
+        route_labels: req.route_labels.split(',').map(|s| s.trim().to_string()).collect(),
+    };
+
+    let t = std::time::Instant::now();
     match engine.simulate(&ipc_req).await {
         Some(resp) if resp.success => {
-            result.logs.push(format!(
-                "[pmm_sim_ok] id={} amount_out={} cu={} elapsed_us={}",
-                resp.id,
-                resp.amount_out.unwrap_or(0),
-                resp.compute_units.unwrap_or(0),
-                t.elapsed().as_micros(),
-            ));
+            result.executed = true;
             result.final_out_amount = resp.amount_out;
             result.consumed_compute_units = resp.compute_units;
             result.success = true;
+            if let (Some(out), Ok(input)) = (resp.amount_out, req.merged_quote.in_amount.parse::<u64>()) {
+                result.simulated_profit = Some(out as i64 - input as i64);
+            }
+            eprintln!(
+                "[sim_result] route_sig={:032x} executed=true success=true final_out={} cu={} elapsed_us={}",
+                req.route_sig,
+                resp.amount_out.unwrap_or(0),
+                resp.compute_units.unwrap_or(0),
+                t.elapsed().as_micros(),
+            );
         }
         Some(resp) => {
-            result.logs.push(format!(
-                "[pmm_sim_fail] id={} error={} elapsed_us={}",
-                resp.id,
+            result.executed = true;
+            result.success = false;
+            eprintln!(
+                "[sim_result] route_sig={:032x} executed=true success=false error={} elapsed_us={}",
+                req.route_sig,
                 resp.error.as_deref().unwrap_or("unknown"),
                 t.elapsed().as_micros(),
-            ));
-            result.success = false;
+            );
         }
         None => {
-            result.logs.push(format!(
-                "[pmm_sim_unavailable] elapsed_us={}",
-                t.elapsed().as_micros()
-            ));
+            result.executed = false;
+            eprintln!(
+                "[sim_result] route_sig={:032x} executed=false reason=engine_unavailable elapsed_us={}",
+                req.route_sig,
+                t.elapsed().as_micros(),
+            );
         }
     }
 

@@ -43,92 +43,32 @@ pub struct CachedAccount {
 /// Thread-safe map from base58 pubkey string → account state.
 pub type AccountCache = Arc<RwLock<HashMap<String, CachedAccount>>>;
 
-/// All PMM pool account pubkeys we subscribe to via Yellowstone gRPC.
-///
-/// Extracted from pmm-sim/cfg/setup.toml. These are the mutable state accounts
-/// (token reserves, market state, oracles) that change with every swap and need
-/// real-time updates. Static accounts (programs, sysvars) are loaded from disk.
-pub const PMM_WATCHED_ACCOUNTS: &[&str] = &[
-    // ── HumidiFi markets (swap-v1/v2/v3 share the same market/base_ta/quote_ta) ──
-    "FksffEqnBRixYGR791Qw2MgdU7zNCpHVFYBL4Fa4qVuH", // market
-    "C3FzbX9n1YD2dow2dCmEv5uNyyf22Gb3TLAEqGBhw5fY", // base_ta
-    "3RWFAQBRkNGq7CMGcTLK3kXDgFTe9jgMeFYqk8nHwcWh", // quote_ta
-    "DB3sUCP2H4icbeKmK6yb6nUxU5ogbcRHtGuq7W2RoRwW",
-    "8BrVfsvzb1DZqCactbYWoKSv24AfsLBuXJqzpzYCwznF",
-    "HsQcHFFNUVTp3MWrXYbuZchBNd4Pwk8636bKzLvpfYNR",
-    "6n9VhCwQ7EwK6NqFDjnHPzEk6wZdRBTfh43RFgHQWHuQ",
-    "Cv9St5tDTGwpbG5UVvM6QvFmf3FYSXc14W9BYvQN5wAZ",
-    "7Rf8Gu8YemSoGjZT3z1cL5BT9HLbGywcyaz8Mrbhd1MH",
-    "AvGeFw71N5sNfV97mZ1uNrHg4yfufRicCJUrS9j2ehTX",
-    "ECEPWwZJ1U1Vjsj1X5sUbZYETKMSCjYHuoTMVitCn64t",
-    "FBWtVVvzsRuAAzVX8ua1hden9KmgPrC2rFijuwEn1ngJ",
-    "5dhYayH9qvzNyCPoh2hKN8TJqumoGsWdyZ9UfPLXBfD9",
-    "86DHdQfRpghMCmXYKDg93bXtmi3doBL5NeY9DYwAj6rz",
-    "FqEVwrQJsJ4AciwJRYLPQEdstDfUYJp6z3f6XYb6MnSb",
-    // HumidiFi v2/v3 extra accounts
-    "4nXmcNY1NjNd9sjA3qajUdUYpVDvwxTzGZT9oS4KpaD1", // add1
-    "J1to1yufRnoWn81KYg1XkTWzmKjnYSnmE2VY8DGUJ9Qv", // vote
-    // ── Tessera ──────────────────────────────────────────────────────────────
-    "FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n", // market
-    "5pVN5XZB8cYBjNLFrsBCPWkCQBan5K5Mq2dWGzwPgGJV", // base_ta
-    "9t4P5wMwfFkyn92Z7hf463qYKEZf8ERVZsGBEPNp8uJx", // quote_ta
-    "8ekCy2jHHUbW2yeNGFWYJT9Hm9FW7SvZcZK66dSZCDiF", // global_state
-    // ── GoonFi ───────────────────────────────────────────────────────────────
-    "4uWuh9fC7rrZKrN8ZdJf69MN1e2S7FPpMqcsyY1aof6K", // market
-    "pKiUC9hDXv52xqU1p3BKypV9AQjAMgfZUGRnoBsdkKm",  // base_ta
-    "Gsy5Zr7Vxn5KckAbduPHHGR1qzPJ4w3GSYmcinWAkhrC", // quote_ta
-    "7XqYD6DEGmDXooB1E8NNRWV9pWAmm1z6WYpsfjnABTUz", // blacklist
-    // ── SolFi V2 ─────────────────────────────────────────────────────────────
-    "65ZHSArs5XxPseKQbB1B4r16vDxMWnCxHMzogDAqiDUc", // market 1
-    "CRo8DBwrmd97DJfAnvCv96tZPL5Mktf2NZy2ZnhDer1A",
-    "GhFfLFSprPpfoRaWakPMmJTMJBHuz6C694jYwxy2dAic",
-    "FmxXDSR9WvpJTCh738D1LEDuhMoA8geCtZgHb3isy7Dp", // cfg
-    "2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou", // oracle
-    "FkEB6uvyzuoaGpgs4yRtFtxC4WJxhejNFbUkj5R6wR32", // market 2
-    "5bHD9xdEzJdkVuhs54mGPC9BZgUshqgMg4tqmTwhWggc",
-    "ARWaajRJyF6PKQryJ4HLzLBfTWM2qmVQUQVtBjk6PgPc",
-    "QoFvFhDZg9TaZEi4SsasWpH5xXzk3zBqfRyicGexfNQ",  // cfg 2
-    "CyCUgmaCYUZxbux3J2svDzxSryVFMtZNPrnMKS41nc4G", // oracle 2
-    // ── ZeroFi ───────────────────────────────────────────────────────────────
-    "2h9hhu3gxY9kCdXEwdTHV8yPAMYVoHgKopRyG1HbDwfi", // market
-    "7RHJ2WfexqUxy7SXfbNZRZDgZi3D9jtMAQp9VhfzpU8T", // vault_info_base
-    "ERP5RTV6cWmoGrv7r9W2V5pbgDFSepc4j97qNnx1Jris",  // vault_base
-    "Ef7zPqj4NuZHwaTczUTY9oRbxXrfZseUcKcqPaidCZ5W",  // vault_info_quote
-    "7wYJVD8iXmMQjND1fwi1hPr68QwruVVtirbotyJZXaVH",  // vault_quote
-    // ── ObricV2 ──────────────────────────────────────────────────────────────
-    "BWBHrYqfcjAh5dSiRwzPnY4656cApXVXmkeDmAfwBKQG", // market
-    "GZsNmWKbqhMYtdSkkvMdEyQF9k5mLmP7tTKYWZjcHVPE", // second_ref_oracle
-    "6YawcNeZ74tRyCv4UfGydYMr7eho7vbUR6ScVffxKAb3",  // third_ref_oracle
-    "C3tPQ8TRcHybnPpR8KMASUVD3PukQRRHEsLwxorJMhgm",  // reserve_x
-    "AAamGhyPfpQJWfZHTq944NM1cFvoVLDrQxt7HGjeRQUS",  // reserve_y
-    "J4HJYz4p7TRP96WVFky3vh7XryxoFehHjoRySUTeSeXw",  // ref_oracle / price_feed
-    // ── BisonFi ──────────────────────────────────────────────────────────────
-    "51FQwjrvo8J8zXUaKyAznJ5NYpoiTCuqAqCu3HAMB9NZ", // market 1
-    "FxGiN5NkigicwrnFshZEAUH9C13yrBALmgYxA9x8sfnQ",  // market_base_ta
-    "6DMF4t6Ks8yXhG8K3rrTAeNYrqNrr1DwewHvBmH3a3FX",  // market_quote_ta
-    "FC9pWtfdtbyGZ5WHTLneoMSUx6jmTDgqKaxDcm2trsND",  // market 2
-    "CL9xU6uijD4FL3ximjt65R6YhUHm1qtiTbBvW1s9TXHZ",
-    "Dp4c6UyCHy6N4Xmg2URwq77SGWCRFGKQJFuDnCkXVUF4",
-];
-
 // ── IPC protocol types ────────────────────────────────────────────────────────
 
-/// Request sent to pmm-sim subprocess stdin (JSON line).
+/// Full transaction simulation request sent to pmm-sim subprocess (JSON line).
 #[derive(Serialize)]
-pub struct PmmSimRequest {
+pub struct FullSimRequest {
     pub id: u64,
-    /// Pubkey of the actual trading keypair (base58).
     pub fee_payer: String,
-    /// All token mints referenced in the route (used to compute ATAs to patch).
-    pub token_mints: Vec<String>,
-    /// Source mint for the first hop.
     pub src_mint: String,
-    /// Amount of src tokens to start the simulation with.
     pub src_amount: u64,
-    /// The actual swap instruction from Metis.
-    pub swap_instruction: IpcInstruction,
-    /// Fresh pool account state from the Yellowstone cache.
+    pub token_mints: Vec<String>,
+    /// ALL instructions: compute_budget + setup + swap + cleanup (in order).
+    pub instructions: Vec<IpcInstruction>,
+    /// Resolved ALT contents (addresses, not ALT account pubkeys).
+    pub lookup_tables: Vec<IpcLookupTable>,
+    /// Fresh account state from Yellowstone cache for accounts in instructions.
     pub accounts: Vec<IpcAccount>,
+    pub jito_tip_lamports: u64,
+    pub cu_limit: u32,
+    pub route_sig: String,
+    pub route_labels: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct IpcLookupTable {
+    pub key: String,
+    pub addresses: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -232,7 +172,7 @@ impl PmmSimEngine {
     /// Returns `None` if the subprocess is unavailable or the call times out.
     pub async fn simulate(
         &self,
-        request: &PmmSimRequest,
+        request: &FullSimRequest,
     ) -> Option<PmmSimResponse> {
         let mut guard = self.handle.lock().await;
         let handle = guard.as_mut()?;
@@ -304,11 +244,12 @@ use tonic::{
 pub fn spawn_yellowstone_subscription(
     endpoint: String,
     x_token: String,
+    watchlist: Vec<String>,
     cache: AccountCache,
 ) {
     tokio::spawn(async move {
         loop {
-            if let Err(e) = run_subscription(&endpoint, &x_token, cache.clone()).await {
+            if let Err(e) = run_subscription(&endpoint, &x_token, &watchlist, cache.clone()).await {
                 warn!("[yellowstone] subscription error: {e} — reconnecting in 2s");
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -319,6 +260,7 @@ pub fn spawn_yellowstone_subscription(
 async fn run_subscription(
     endpoint: &str,
     x_token: &str,
+    watchlist: &[String],
     cache: AccountCache,
 ) -> anyhow::Result<()> {
     let channel = Channel::from_shared(endpoint.to_string())?
@@ -336,14 +278,23 @@ async fn run_subscription(
         Ok(req)
     });
 
-    let accounts_filter = SubscribeRequestFilterAccounts {
-        account: PMM_WATCHED_ACCOUNTS.iter().map(|s| s.to_string()).collect(),
-        owner: vec![],
-        nonempty_txn_signature: false,
-    };
+    // Split watchlist into chunks of 1000 for the filter (provider limits may vary).
+    let mut accounts_map = std::collections::HashMap::new();
+    for (i, chunk) in watchlist.chunks(1000).enumerate() {
+        accounts_map.insert(format!("accounts_{i}"), SubscribeRequestFilterAccounts {
+            account: chunk.to_vec(),
+            owner: vec![],
+            nonempty_txn_signature: false,
+        });
+    }
+    if accounts_map.is_empty() {
+        // Empty watchlist — nothing to subscribe to; sleep and retry.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        return Ok(());
+    }
 
     let sub_request = SubscribeRequest {
-        accounts: [("pmm_pools".to_string(), accounts_filter)].into_iter().collect(),
+        accounts: accounts_map,
         commitment: Some(CommitmentLevel::Processed as i32),
         ..Default::default()
     };
@@ -384,59 +335,82 @@ async fn run_subscription(
 
 // ── Request builder helpers ───────────────────────────────────────────────────
 
-/// Build a `PmmSimRequest` from a Metis swap instruction + current account cache.
-///
-/// Collects all accounts from the cache whose pubkeys appear in the instruction's
-/// account list, so the subprocess always has the freshest state.
-pub fn build_sim_request(
-    id: u64,
-    fee_payer: &str,
-    swap_ix: &crate::metis::InstructionData,
-    token_mints: Vec<String>,
-    src_mint: &str,
-    src_amount: u64,
+/// Collect IpcAccounts for all pubkeys referenced in the given instructions, from the cache.
+pub fn collect_all_instruction_accounts(
+    instructions: &[&crate::metis::InstructionData],
     cache: &AccountCache,
-) -> PmmSimRequest {
-    let ix_pubkeys: Vec<String> = swap_ix.accounts.iter().map(|a| a.pubkey.clone()).collect();
+) -> Vec<IpcAccount> {
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    let r = match cache.read() { Ok(r) => r, Err(_) => return result };
+    for ix in instructions {
+        for am in &ix.accounts {
+            if seen.insert(am.pubkey.clone()) {
+                if let Some(acc) = r.get(&am.pubkey) {
+                    result.push(IpcAccount {
+                        pubkey: am.pubkey.clone(),
+                        lamports: acc.lamports,
+                        data: B64.encode(&acc.data),
+                        owner: bs58::encode(acc.owner).into_string(),
+                        executable: acc.executable,
+                        rent_epoch: acc.rent_epoch,
+                    });
+                }
+            }
+        }
+    }
+    result
+}
 
-    let accounts: Vec<IpcAccount> = if let Ok(r) = cache.read() {
-        ix_pubkeys
-            .iter()
-            .filter_map(|pk| {
-                r.get(pk).map(|acc| IpcAccount {
-                    pubkey: pk.clone(),
-                    lamports: acc.lamports,
-                    data: B64.encode(&acc.data),
-                    owner: bs58::encode(acc.owner).into_string(),
-                    executable: acc.executable,
-                    rent_epoch: acc.rent_epoch,
-                })
-            })
-            .collect()
-    } else {
-        vec![]
-    };
+/// Bootstrap account cache from RPC using batched getMultipleAccounts.
+pub fn bootstrap_from_rpc(
+    watchlist: &[String],
+    cache: &AccountCache,
+    rpc: &solana_client::rpc_client::RpcClient,
+    batch_size: usize,
+) {
+    use solana_sdk::pubkey::Pubkey;
+    let batch_size = batch_size.min(100).max(1);
+    let mut total = 0usize;
+    let chunks: usize = (watchlist.len() + batch_size - 1) / batch_size;
+    for chunk in watchlist.chunks(batch_size) {
+        let pubkeys: Vec<Pubkey> = chunk.iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        match rpc.get_multiple_accounts(&pubkeys) {
+            Ok(accounts) => {
+                let mut w = match cache.write() { Ok(w) => w, Err(_) => continue };
+                for (pk, maybe_acc) in pubkeys.iter().zip(accounts.iter()) {
+                    if let Some(acc) = maybe_acc {
+                        w.insert(pk.to_string(), CachedAccount {
+                            lamports: acc.lamports,
+                            data: acc.data.clone(),
+                            owner: acc.owner.to_bytes(),
+                            executable: acc.executable,
+                            rent_epoch: acc.rent_epoch,
+                        });
+                        total += 1;
+                    }
+                }
+            }
+            Err(e) => eprintln!("[cache_bootstrap] RPC batch error: {e}"),
+        }
+    }
+    eprintln!("[cache_bootstrap] accounts={total} batches={chunks}");
+}
 
-    PmmSimRequest {
-        id,
-        fee_payer: fee_payer.to_string(),
-        token_mints,
-        src_mint: src_mint.to_string(),
-        src_amount,
-        swap_instruction: IpcInstruction {
-            program_id: swap_ix.program_id.clone(),
-            accounts: swap_ix
-                .accounts
-                .iter()
-                .map(|a| IpcAccountMeta {
-                    pubkey: a.pubkey.clone(),
-                    is_signer: a.is_signer,
-                    is_writable: a.is_writable,
-                })
-                .collect(),
-            data: swap_ix.data.clone(),
-        },
-        accounts,
+/// Write a programs_registry.json file to programs_path for pmm-sim to load extra programs.
+pub fn write_programs_registry(programs: &[crate::config::ProgramEntry], programs_path: &str) {
+    use std::io::Write as _;
+    if programs.is_empty() { return; }
+    let path = format!("{programs_path}/programs_registry.json");
+    let json = serde_json::to_string_pretty(programs).unwrap_or_default();
+    match std::fs::File::create(&path) {
+        Ok(mut f) => {
+            let _ = f.write_all(json.as_bytes());
+            eprintln!("[pmm_sim] wrote programs_registry: {path} ({} programs)", programs.len());
+        }
+        Err(e) => eprintln!("[pmm_sim] cannot write programs_registry {path}: {e}"),
     }
 }
 

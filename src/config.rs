@@ -1,5 +1,5 @@
 use anyhow::Result;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -238,6 +238,13 @@ impl Default for YellowstoneGrpcConfig {
     }
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct ProgramEntry {
+    pub label: String,
+    pub program_id: String,
+    pub so_path: String,
+}
+
 /// Configuration for the pmm-sim subprocess integration.
 #[derive(Debug, Deserialize, Clone)]
 pub struct PmmSimConfig {
@@ -259,6 +266,27 @@ pub struct PmmSimConfig {
     /// Timeout in milliseconds for a single simulation request.
     #[serde(default = "default_pmm_sim_timeout_ms")]
     pub timeout_ms: u64,
+    /// Path to Metis mix.json (pool definitions). Used to build the Yellowstone watchlist.
+    #[serde(default = "default_mix_json_path")]
+    pub mix_json_path: String,
+    /// Path to extra .so program files for full-tx simulation (e.g. /root/s/so/).
+    #[serde(default)]
+    pub extra_programs_path: String,
+    /// If true, candidates are dropped unless simulation succeeded.
+    #[serde(default)]
+    pub simulation_gate: bool,
+    /// Minimum simulated profit (lamports) to allow Jito send (only used when simulation_gate=true).
+    #[serde(default)]
+    pub min_profit_after_sim_lamports: i64,
+    /// Whether to bootstrap account cache from RPC at startup (batch getMultipleAccounts).
+    #[serde(default)]
+    pub rpc_bootstrap: bool,
+    /// Batch size for RPC account bootstrap (max 100).
+    #[serde(default = "default_rpc_bootstrap_batch_size")]
+    pub rpc_bootstrap_batch_size: usize,
+    /// Programs to load into pmm-sim LiteSVM for full-transaction simulation.
+    #[serde(default)]
+    pub programs: Vec<ProgramEntry>,
 }
 
 fn default_pmm_sim_enabled() -> bool { false }
@@ -267,6 +295,8 @@ fn default_pmm_sim_setup() -> String { "./pmm-sim/cfg/setup.toml".to_string() }
 fn default_pmm_sim_programs() -> String { "./pmm-sim/cfg/programs".to_string() }
 fn default_pmm_sim_accounts() -> String { "./pmm-sim/cfg/accounts".to_string() }
 fn default_pmm_sim_timeout_ms() -> u64 { 50 }
+fn default_mix_json_path() -> String { "/root/metis/1/mix.json".to_string() }
+fn default_rpc_bootstrap_batch_size() -> usize { 100 }
 
 impl Default for PmmSimConfig {
     fn default() -> Self {
@@ -277,6 +307,13 @@ impl Default for PmmSimConfig {
             programs_path: default_pmm_sim_programs(),
             accounts_path: default_pmm_sim_accounts(),
             timeout_ms: default_pmm_sim_timeout_ms(),
+            mix_json_path: default_mix_json_path(),
+            extra_programs_path: String::new(),
+            simulation_gate: false,
+            min_profit_after_sim_lamports: 0,
+            rpc_bootstrap: false,
+            rpc_bootstrap_batch_size: default_rpc_bootstrap_batch_size(),
+            programs: Vec::new(),
         }
     }
 }

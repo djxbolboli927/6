@@ -68,8 +68,28 @@ struct ServeRequest {
     token_mints: Vec<String>,
     src_mint: String,
     src_amount: u64,
-    swap_instruction: ServeIx,
+    /// ALL instructions: compute_budget + setup + swap + cleanup.
+    instructions: Vec<ServeIx>,
+    #[serde(default)]
+    lookup_tables: Vec<ServeLookupTable>,
     accounts: Vec<ServeAccount>,
+    #[serde(default = "default_jito_tip")]
+    jito_tip_lamports: u64,
+    #[serde(default = "default_cu_limit")]
+    cu_limit: u32,
+    #[serde(default)]
+    route_sig: String,
+}
+
+fn default_jito_tip() -> u64 { 1600 }
+fn default_cu_limit() -> u32 { 1_400_000 }
+
+#[derive(Deserialize)]
+struct ServeLookupTable {
+    #[allow(dead_code)]
+    key: String,
+    #[allow(dead_code)]
+    addresses: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -175,6 +195,36 @@ pub fn run(programs_path: &str) -> eyre::Result<()> {
 
 // ── SVM initialisation ────────────────────────────────────────────────────────
 
+fn load_extra_programs(svm: &mut LiteSVM, programs_path: &str) {
+    let registry_path = format!("{programs_path}/programs_registry.json");
+    let content = match std::fs::read_to_string(&registry_path) {
+        Ok(c) => c,
+        Err(_) => return, // no registry = no extra programs
+    };
+    #[derive(serde::Deserialize)]
+    struct PEntry { label: String, program_id: String, so_path: String }
+    let entries: Vec<PEntry> = match serde_json::from_str(&content) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("[pmm-sim serve] error parsing {registry_path}: {e}");
+            return;
+        }
+    };
+    for e in &entries {
+        if !std::path::Path::new(&e.so_path).exists() {
+            eprintln!("[pmm-sim serve] program .so not found: {} ({})", e.label, e.so_path);
+            continue;
+        }
+        match Pubkey::from_str(&e.program_id) {
+            Ok(pk) => match svm.add_program_from_file(pk, &e.so_path) {
+                Ok(_) => eprintln!("[pmm-sim serve] loaded: {} ({})", e.label, e.program_id),
+                Err(err) => eprintln!("[pmm-sim serve] failed to load {}: {err}", e.label),
+            },
+            Err(_) => eprintln!("[pmm-sim serve] invalid program_id for {}: {}", e.label, e.program_id),
+        }
+    }
+}
+
 fn build_base_svm(programs_path: &str) -> eyre::Result<LiteSVM> {
     let mut budget = ComputeBudget::new_with_defaults(false, false);
     budget.compute_unit_limit = consts::COMPUTE_UNITS_LIMIT;
@@ -190,6 +240,9 @@ fn build_base_svm(programs_path: &str) -> eyre::Result<LiteSVM> {
 
     // Load all supported PMM programs.
     load_pmm_programs(&mut svm, programs_path)?;
+
+    // Load extra programs from programs_registry.json (external DEX programs).
+    load_extra_programs(&mut svm, programs_path);
 
     eprintln!("[pmm-sim serve] LiteSVM ready (programs_path={programs_path})");
     Ok(svm)
@@ -240,21 +293,21 @@ fn fund_wallet(svm: &mut LiteSVM, pubkey: &Pubkey, lamports: u64) {
 
 // ── Per-request processing ────────────────────────────────────────────────────
 
+const COMPUTE_BUDGET_PROGRAM_ID: &str = "ComputeBudget111111111111111111111111111111";
+
 fn process_request(svm: &mut LiteSVM, sim_wallet: &Keypair, line: &str) -> eyre::Result<ServeResponse> {
     let req: ServeRequest = serde_json::from_str(line)?;
 
-    // Parse pubkeys.
     let fee_payer = Pubkey::from_str(&req.fee_payer)
         .map_err(|e| eyre::eyre!("invalid fee_payer: {e}"))?;
     let src_mint = Pubkey::from_str(&req.src_mint)
         .map_err(|e| eyre::eyre!("invalid src_mint: {e}"))?;
 
-    // Parse all token mints for ATA patching.
     let token_mints: Vec<Pubkey> = req.token_mints.iter()
         .filter_map(|s| Pubkey::from_str(s).ok())
         .collect();
 
-    // Inject fresh pool accounts into the SVM.
+    // Inject pool accounts into SVM.
     for acc in &req.accounts {
         let pk = Pubkey::from_str(&acc.pubkey)
             .map_err(|e| eyre::eyre!("invalid account pubkey {}: {e}", acc.pubkey))?;
@@ -264,27 +317,24 @@ fn process_request(svm: &mut LiteSVM, sim_wallet: &Keypair, line: &str) -> eyre:
             .map_err(|e| eyre::eyre!("invalid owner for {}: {e}", acc.pubkey))?;
         let owner: [u8; 32] = owner_bytes.try_into()
             .map_err(|_| eyre::eyre!("owner not 32 bytes for {}", acc.pubkey))?;
-        let account = Account {
+        svm.set_account(pk, Account {
             lamports: acc.lamports,
             data,
             owner: Pubkey::from(owner),
             executable: acc.executable,
             rent_epoch: acc.rent_epoch,
-        };
-        svm.set_account(pk, account)?;
+        })?;
     }
 
-    // Set up mint accounts (needed for ATA creation).
-    svm.set_account(src_mint, Misc::mk_mint_acc(9))?; // assume 9 decimals (WSOL)
+    // Set up mint accounts.
+    svm.set_account(src_mint, Misc::mk_mint_acc(9))?;
     for mint in &token_mints {
         if *mint != src_mint {
-            // Assume 6 decimals for non-WSOL tokens; exact decimals don't affect swap logic.
             svm.set_account(*mint, Misc::mk_mint_acc(6))?;
         }
     }
 
-    // Compute original ATAs (fee_payer's) and replacement ATAs (sim_wallet's).
-    // Build a replacement map: original_pubkey → replacement_pubkey.
+    // Build replacement map: fee_payer → sim_wallet, ATAs → sim ATAs.
     let mut replace: HashMap<Pubkey, Pubkey> = HashMap::new();
     replace.insert(fee_payer, sim_wallet.pubkey());
     for mint in &token_mints {
@@ -293,50 +343,57 @@ fn process_request(svm: &mut LiteSVM, sim_wallet: &Keypair, line: &str) -> eyre:
         replace.insert(orig_ata, sim_ata);
     }
 
-    // Set up the simulation wallet's ATAs with correct starting balances.
+    // Set up simulation wallet ATAs.
     for mint in &token_mints {
         let amount = if *mint == src_mint { req.src_amount } else { 0 };
         let sim_ata = get_associated_token_address(&sim_wallet.pubkey(), mint);
         svm.set_account(sim_ata, Misc::mk_ata(mint, &sim_wallet.pubkey(), amount))?;
     }
 
-    // Re-fund the simulation wallet to cover transaction fees.
-    svm.set_account(
-        sim_wallet.pubkey(),
-        Account {
-            lamports: consts::AIRDROP_AMOUNT,
-            data: vec![],
-            owner: solana_sdk::system_program::id(),
-            executable: false,
-            rent_epoch: u64::MAX,
-        },
-    )?;
+    // Re-fund simulation wallet.
+    svm.set_account(sim_wallet.pubkey(), Account {
+        lamports: consts::AIRDROP_AMOUNT,
+        data: vec![],
+        owner: solana_sdk::system_program::id(),
+        executable: false,
+        rent_epoch: u64::MAX,
+    })?;
 
-    // Build the patched instruction.
-    let program_id = Pubkey::from_str(&req.swap_instruction.program_id)
-        .map_err(|e| eyre::eyre!("invalid program_id: {e}"))?;
-    let ix_data = B64.decode(&req.swap_instruction.data)
-        .map_err(|e| eyre::eyre!("invalid instruction data: {e}"))?;
+    // Read initial src balance for profit calculation.
+    let src_ata = get_associated_token_address(&sim_wallet.pubkey(), &src_mint);
+    let initial_balance = token_balance_from_svm(svm, &src_ata);
 
-    let accounts: Vec<AccountMeta> = req.swap_instruction.accounts.iter()
-        .map(|a| {
-            let pk = Pubkey::from_str(&a.pubkey).unwrap_or_default();
-            // Apply replacement: use sim_wallet's accounts where fee_payer's were.
-            let pk = *replace.get(&pk).unwrap_or(&pk);
-            match (a.is_writable, a.is_signer) {
-                (true,  true)  => AccountMeta::new(pk, true),
-                (true,  false) => AccountMeta::new(pk, false),
-                (false, true)  => AccountMeta::new_readonly(pk, true),
-                (false, false) => AccountMeta::new_readonly(pk, false),
-            }
-        })
-        .collect();
+    // Build patched instructions (skip ComputeBudget, patch fee_payer/ATAs).
+    let mut ixs: Vec<Instruction> = Vec::new();
+    for serve_ix in &req.instructions {
+        if serve_ix.program_id == COMPUTE_BUDGET_PROGRAM_ID {
+            continue; // LiteSVM has its own budget; skip these
+        }
+        let program_id = Pubkey::from_str(&serve_ix.program_id)
+            .map_err(|e| eyre::eyre!("invalid program_id {}: {e}", serve_ix.program_id))?;
+        let ix_data = B64.decode(&serve_ix.data)
+            .map_err(|e| eyre::eyre!("invalid instruction data: {e}"))?;
+        let accounts: Vec<AccountMeta> = serve_ix.accounts.iter()
+            .map(|a| {
+                let pk = Pubkey::from_str(&a.pubkey).unwrap_or_default();
+                let pk = *replace.get(&pk).unwrap_or(&pk);
+                match (a.is_writable, a.is_signer) {
+                    (true,  true)  => AccountMeta::new(pk, true),
+                    (true,  false) => AccountMeta::new(pk, false),
+                    (false, true)  => AccountMeta::new_readonly(pk, true),
+                    (false, false) => AccountMeta::new_readonly(pk, false),
+                }
+            })
+            .collect();
+        ixs.push(Instruction { program_id, accounts, data: ix_data });
+    }
 
-    let ix = Instruction { program_id, accounts, data: ix_data };
+    if ixs.is_empty() {
+        return Err(eyre::eyre!("no executable instructions after filtering"));
+    }
 
-    // Create and sign the transaction (sigverify is disabled in the SVM).
     let tx = Transaction::new_signed_with_payer(
-        &[ix],
+        &ixs,
         Some(&sim_wallet.pubkey()),
         &[sim_wallet],
         svm.latest_blockhash(),
@@ -344,14 +401,21 @@ fn process_request(svm: &mut LiteSVM, sim_wallet: &Keypair, line: &str) -> eyre:
 
     match svm.send_transaction(tx) {
         Ok(meta) => {
-            let amount_out = meta.logs.iter().find_map(|log| {
-                log.split("after_destination_balance: ")
-                    .nth(1)?
-                    .split(|c: char| !c.is_ascii_digit())
-                    .next()?
-                    .parse::<u64>()
-                    .ok()
-            });
+            // Use balance change as profit source; fall back to log parsing.
+            let final_balance = token_balance_from_svm(svm, &src_ata);
+            let amount_out = if final_balance > initial_balance {
+                Some(final_balance - initial_balance)
+            } else {
+                // Fallback: try parsing "after_destination_balance: N" from logs.
+                meta.logs.iter().find_map(|log| {
+                    log.split("after_destination_balance: ")
+                        .nth(1)?
+                        .split(|c: char| !c.is_ascii_digit())
+                        .next()?
+                        .parse::<u64>()
+                        .ok()
+                })
+            };
             Ok(ServeResponse {
                 id: req.id,
                 success: true,
@@ -360,17 +424,27 @@ fn process_request(svm: &mut LiteSVM, sim_wallet: &Keypair, line: &str) -> eyre:
                 error: None,
             })
         }
-        Err(failed) => {
-            let err_msg = format!("{:?}", failed.err);
-            Ok(ServeResponse {
-                id: req.id,
-                success: false,
-                amount_out: None,
-                compute_units: Some(failed.meta.compute_units_consumed),
-                error: Some(err_msg),
-            })
-        }
+        Err(failed) => Ok(ServeResponse {
+            id: req.id,
+            success: false,
+            amount_out: None,
+            compute_units: Some(failed.meta.compute_units_consumed),
+            error: Some(format!("{:?}", failed.err)),
+        }),
     }
+}
+
+fn token_balance_from_svm(svm: &LiteSVM, ata: &Pubkey) -> u64 {
+    svm.get_account(ata)
+        .and_then(|a| {
+            // SPL token account: amount is at bytes 64..72 (little-endian u64).
+            if a.data.len() >= 72 {
+                Some(u64::from_le_bytes(a.data[64..72].try_into().ok()?))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

@@ -6,6 +6,7 @@ mod jito;
 mod jito_grpc;
 mod metis;
 mod metrics;
+mod mix_watchlist;
 mod pmm_sim;
 mod rate_limiter;
 mod sim;
@@ -130,9 +131,30 @@ async fn async_main(config: config::Config) -> Result<()> {
     // ── PMM simulation: account cache (Yellowstone) + pmm-sim subprocess ───────
     let pmm_cache = pmm_sim::new_account_cache();
     pmm_sim::preload_cache_from_disk(&config.pmm_sim.accounts_path, &pmm_cache);
+
+    // Load dynamic watchlist from mix.json (all pool accounts for Yellowstone).
+    let mix_watchlist_set = mix_watchlist::load_mix_watchlist(&config.pmm_sim.mix_json_path);
+    let mix_watchlist: Vec<String> = mix_watchlist_set.into_iter().collect();
+
+    // Bootstrap account state from RPC before first simulation (optional).
+    if config.pmm_sim.rpc_bootstrap && !mix_watchlist.is_empty() {
+        eprintln!("[main] starting RPC account bootstrap ({} accounts)...", mix_watchlist.len());
+        let rpc_clone = rpc_client.clone();
+        let cache_clone = pmm_cache.clone();
+        let batch = config.pmm_sim.rpc_bootstrap_batch_size;
+        let wl = mix_watchlist.clone();
+        tokio::task::spawn_blocking(move || {
+            pmm_sim::bootstrap_from_rpc(&wl, &cache_clone, &rpc_clone, batch);
+        }).await.ok();
+    }
+
+    // Write programs registry for pmm-sim serve to load extra .so files.
+    pmm_sim::write_programs_registry(&config.pmm_sim.programs, &config.pmm_sim.programs_path);
+
     pmm_sim::spawn_yellowstone_subscription(
         config.yellowstone_grpc.endpoint.clone(),
         config.yellowstone_grpc.x_token.clone(),
+        mix_watchlist.clone(),
         pmm_cache.clone(),
     );
     let pmm_engine = pmm_sim::PmmSimEngine::new(config.pmm_sim.clone());
@@ -190,6 +212,8 @@ async fn async_main(config: config::Config) -> Result<()> {
         pmm_engine,
         pmm_cache,
         fee_payer_str,
+        config.pmm_sim.simulation_gate,
+        config.pmm_sim.min_profit_after_sim_lamports,
     );
 
     eprintln!(

@@ -43,6 +43,8 @@ pub struct Metrics {
     pub sim_unsupported: AtomicU64,
     /// Candidates dropped from sim_queue as stale (age > queue_max_age_ms).
     pub sim_stale: AtomicU64,
+    /// Candidates dropped by the simulation gate (sim failed, not executed, or insufficient profit).
+    pub sim_failed: AtomicU64,
 
     // ── Stage 3: worker processing ────────────────────────────────────────────
     pub dropped_stale: AtomicU64,
@@ -85,6 +87,7 @@ impl Metrics {
             sim_classified: AtomicU64::new(0),
             sim_unsupported: AtomicU64::new(0),
             sim_stale: AtomicU64::new(0),
+            sim_failed: AtomicU64::new(0),
             dropped_stale: AtomicU64::new(0),
             tx_build_failed: AtomicU64::new(0),
             tx_too_large: AtomicU64::new(0),

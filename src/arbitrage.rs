@@ -507,6 +507,8 @@ pub fn spawn_sim_workers(
     engine: Arc<crate::pmm_sim::PmmSimEngine>,
     cache: crate::pmm_sim::AccountCache,
     fee_payer: String,
+    simulation_gate: bool,
+    min_profit_after_sim_lamports: i64,
 ) {
     for _ in 0..worker_count {
         let sim_q = sim_queue.clone();
@@ -550,8 +552,30 @@ pub fn spawn_sim_workers(
                     result.elapsed_us,
                 );
 
-                // Forward ALL candidates to Jito regardless of sim result.
-                // Phase 3 will gate on result.success here.
+                // Gate: if simulation_gate is enabled, only forward to Jito when sim passed.
+                if simulation_gate {
+                    let gate_ok = result.executed
+                        && result.success
+                        && result.simulated_profit.unwrap_or(i64::MIN) >= min_profit_after_sim_lamports;
+                    if !gate_ok {
+                        let reason = if !result.executed { "sim_not_executed" }
+                                     else if !result.success { "sim_failed" }
+                                     else { "insufficient_profit" };
+                        eprintln!(
+                            "[sim_gate_drop] route_sig={:032x} reason={reason} labels={}",
+                            result.route_sig, result.route_labels,
+                        );
+                        met.sim_failed.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    eprintln!(
+                        "[sim_gate] route_sig={:032x} action=jito_send profit={} labels={}",
+                        result.route_sig,
+                        result.simulated_profit.unwrap_or(0),
+                        result.route_labels,
+                    );
+                }
+
                 pipe.push(
                     ReadyInstruction {
                         swap_ixs: req.instructions,
