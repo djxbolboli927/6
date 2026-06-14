@@ -1,9 +1,4 @@
 [workspace]
-# Workspace root.  The LiteSVM source lives at vendor/litesvm (committed
-# directly to this repo for reference).  Cargo pulls litesvm via git dep
-# (see litesvm = { git = ... } below) — the path dep cannot be used here
-# because Cargo resolves 'workspace = true' from the patching workspace root,
-# not litesvm's own workspace root.
 resolver = "2"
 
 [package]
@@ -60,25 +55,6 @@ anyhow = "1"
 thiserror = "1"
 core_affinity = "0.8"
 
-# Local SVM simulation (pre-flight filter before Jito send).
-# Git dep so Cargo resolves litesvm's own workspace dependencies correctly.
-# The vendored source at vendor/litesvm is a reference copy at the same commit.
-litesvm = { git = "https://github.com/LiteSVM/litesvm", branch = "master" }
-# solana-account must match litesvm's workspace pin (3.2.0) so the Account
-# type that crosses the Yellowstone cache → LiteSVM boundary is the same type.
-solana-account = "3.2.0"
-# litesvm 0.11 uses granular solana-* crates at major version 2-3.
-# Declared explicitly so litesvm_sim.rs can import the types needed for the
-# conversion adapters at the solana-sdk 2.x / litesvm 3.x type boundary.
-solana-address = "2"
-solana-clock = "3.0.1"
-solana-transaction = "3"
-dashmap = "6"
-
-# Yellowstone gRPC — live account-state stream (feeds sim cache, same source as Metis).
-# Version 6.1 aligns with solana-sdk ~2.2 used elsewhere in this crate.
-yellowstone-grpc-client = "6.1"
-yellowstone-grpc-proto = "6.1"
 
 [build-dependencies]
 tonic-build = "0.12"

@@ -8,14 +8,9 @@ pub struct Config {
     pub trading: TradingConfig,
     pub jito: JitoConfig,
     pub rpc: RpcConfig,
-    pub yellowstone_grpc: YellowstoneGrpcConfig,
     pub performance: PerformanceConfig,
     #[serde(default)]
-    pub simulation: SimulationConfig,
-    #[serde(default)]
     pub jito_grpc: JitoGrpcConfig,
-    #[serde(default)]
-    pub template_cache: TemplateCacheConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -55,117 +50,12 @@ pub struct JitoConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct RpcConfig {
     pub url: String,
-    /// Commitment level for all RPC reads (account fetches, sim-compare,
-    /// retry snapshots). Must match the Yellowstone stream commitment
-    /// ("processed") so the cache and the RPC baseline see the same slot.
-    /// Using the default "finalized" makes every actively-traded pool look
-    /// stale because finalized lags the processed stream by ~30+ slots.
     #[serde(default = "default_rpc_commitment")]
     pub commitment: String,
-    /// Additional public RPC endpoints tried in order when the primary RPC
-    /// fails an account-fetch (`getMultipleAccounts`). These are ONLY used
-    /// for account data — never for blockhash, transaction simulation, or
-    /// Jito submission. Leave empty to disable fallback.
-    #[serde(default)]
-    pub fallback_rpc_urls: Vec<String>,
 }
 
 fn default_rpc_commitment() -> String {
     "processed".to_string()
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct YellowstoneGrpcConfig {
-    pub endpoint: String,
-    pub x_token: String,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct SimulationConfig {
-    /// If false, bot sends every profitable tx without any local sim gate
-    /// (pre-LiteSVM behaviour). Default: disabled so legacy configs keep
-    /// working until the operator opts in.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Directory containing the DEX .so binaries listed in `program_registry`.
-    #[serde(default = "default_so_dir")]
-    pub so_dir: String,
-    /// Directory containing per-pool account files (`dex/<DEX>/<pool>.toml`).
-    /// These are pre-fetched at startup and the vault accounts within are
-    /// subscribed for live Yellowstone updates.
-    #[serde(default = "default_dex_dir")]
-    pub dex_dir: String,
-    /// Canonical DEX keys kept for operator config compatibility and reporting.
-    /// With `simulation.enabled=true`, all routes are simulated regardless of
-    /// this list; missing programs/accounts fail closed instead of bypassing.
-    #[serde(default = "default_simulation_dexes", alias = "enabled_exchanges")]
-    pub enabled_dexes: Vec<String>,
-    /// When sim reverts or errors, `fail_closed=true` drops the send (safest);
-    /// `false` logs and forwards to Jito anyway (useful during rollout).
-    #[serde(default = "default_true")]
-    pub fail_closed: bool,
-    /// Number of INDEPENDENT Simulator instances to spin up. Each Simulator
-    /// owns its own `Mutex<LiteSVM>`, so N workers = N sims in parallel.
-    /// Sizing guidance: in steady state each sim takes ~2-5ms of CPU, so
-    /// `workers` should roughly equal the peak number of profitable
-    /// opportunities that arrive per 5ms window. In production, 8 is a
-    /// sensible default (handles ~1600 sims/sec with headroom).
-    #[serde(default = "default_workers")]
-    pub workers: usize,
-    /// Startup RPC warm-up rate. For mix.json this is interpreted as pools
-    /// per second because each pool group is fetched with getMultipleAccounts.
-    #[serde(default = "default_prefetch_pools_per_second")]
-    pub prefetch_pools_per_second: u64,
-    /// Production should keep this false: simulation may use cache/gRPC state,
-    /// but it must not wait on RPC in the hot path.
-    #[serde(default)]
-    pub allow_hot_path_rpc_fetch: bool,
-}
-
-impl Default for SimulationConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            so_dir: default_so_dir(),
-            dex_dir: default_dex_dir(),
-            enabled_dexes: default_simulation_dexes(),
-            fail_closed: true,
-            workers: default_workers(),
-            prefetch_pools_per_second: default_prefetch_pools_per_second(),
-            allow_hot_path_rpc_fetch: false,
-        }
-    }
-}
-
-fn default_so_dir() -> String {
-    "/home/soluser/m/so".to_string()
-}
-
-fn default_dex_dir() -> String {
-    "vendor/litesvm/dex".to_string()
-}
-
-fn default_simulation_dexes() -> Vec<String> {
-    vec![
-        "meteora_damm_v2".to_string(),
-        "meteora_dlmm".to_string(),
-        "raydium_amm_v4".to_string(),
-        "raydium_clmm".to_string(),
-        "raydium_cpmm".to_string(),
-        "whirlpool".to_string(),
-    ]
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_workers() -> usize {
-    8
-}
-
-fn default_prefetch_pools_per_second() -> u64 {
-    5
 }
 
 /// Second Jito submission path via SearcherService gRPC.
@@ -307,57 +197,6 @@ fn default_calc_workers() -> usize {
 
 fn default_queue_max_age_ms() -> u64 {
     5000
-}
-
-/// Template cache configuration.
-///
-/// Rollout order:
-///   1. save_new=true       — extract and store route/hop templates from Metis
-///                            responses. No behaviour change yet.
-///   2. serve_route=true    — serve from RouteTemplate on hit, patching
-///                            in_amount / quoted_out_amount in the Borsh data.
-///                            Falls back to Metis when patching is not possible.
-///   3. serve_from_metis=false — RAM-only (miss = drop, no Metis call).
-#[derive(Debug, Deserialize, Clone)]
-pub struct TemplateCacheConfig {
-    /// Hard test switch: never serve or save templates; every instruction must
-    /// come from a fresh Metis /swap-instructions response.
-    #[serde(default)]
-    pub force_fresh_metis_all: bool,
-    /// Extract and save route/hop templates from every Metis response.
-    #[serde(default)]
-    pub save_new: bool,
-    /// Serve from RouteTemplate when available (patches amounts if needed).
-    #[serde(default)]
-    pub serve_route: bool,
-    /// Call Metis for instructions when no route template hits.
-    #[serde(default = "default_true_tc")]
-    pub serve_from_metis: bool,
-    /// DEBUG/throughput switch. Normally DEXes with opaque pricing (SolFi,
-    /// AlphaQ, Tessera, GoonFi, ZeroFi, PancakeSwap, Byreal) are forced through
-    /// fresh Metis because their RAM templates cannot be safely amount-patched.
-    /// Set true to ignore that rule and allow RAM/template serving for them too.
-    /// This raises simulation throughput (more routes served from RAM) at the
-    /// cost of possibly-stale patched amounts; intended for error-collection
-    /// debug runs, not production trading.
-    #[serde(default)]
-    pub ignore_opaque_dex: bool,
-}
-
-impl Default for TemplateCacheConfig {
-    fn default() -> Self {
-        Self {
-            force_fresh_metis_all: false,
-            save_new: false,
-            serve_route: false,
-            serve_from_metis: true,
-            ignore_opaque_dex: false,
-        }
-    }
-}
-
-fn default_true_tc() -> bool {
-    true
 }
 
 impl Config {
