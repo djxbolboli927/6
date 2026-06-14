@@ -290,7 +290,7 @@ pub struct PmmSimConfig {
 }
 
 fn default_pmm_sim_enabled() -> bool { false }
-fn default_pmm_sim_binary() -> String { "./pmm-sim/target/release/pmm-sim".to_string() }
+fn default_pmm_sim_binary() -> String { "./sim-server/target/release/sim-server".to_string() }
 fn default_pmm_sim_setup() -> String { "./pmm-sim/cfg/setup.toml".to_string() }
 fn default_pmm_sim_programs() -> String { "./pmm-sim/cfg/programs".to_string() }
 fn default_pmm_sim_accounts() -> String { "./pmm-sim/cfg/accounts".to_string() }
