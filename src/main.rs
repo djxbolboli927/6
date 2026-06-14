@@ -7,6 +7,7 @@ mod jito_grpc;
 mod metis;
 mod metrics;
 mod rate_limiter;
+mod sim;
 mod token_metrics;
 mod tokens;
 mod transaction;
@@ -127,6 +128,9 @@ async fn async_main(config: config::Config) -> Result<()> {
 
     let blockhash_cache = Arc::new(BlockhashCache::new(rpc_client.clone()));
 
+    // Simulation queue: sits between Metis instruction fetch and Jito send.
+    let sim_queue = sim::SimQueue::new();
+
     let calc_ctx = Arc::new(arbitrage::CalcCtx {
         metis: metis.clone(),
         blockhash_cache: blockhash_cache.clone(),
@@ -142,14 +146,18 @@ async fn async_main(config: config::Config) -> Result<()> {
         swap_ix_state: Arc::new(arbitrage::SwapIxState::new(
             config.performance.max_concurrent_swap_instructions,
         )),
+        sim_queue: sim_queue.clone(),
     });
 
     let worker_count = config.performance.calc_workers.max(1);
+    let sim_worker_count = config.performance.sim_workers.max(1);
     let jito_capacity = config.jito.max_bundles_per_second as usize
         + jito_grpc_limiter
             .as_ref()
             .map(|_| config.jito_grpc.max_bundles_per_second as usize)
             .unwrap_or(0);
+
+    // Stage 3: Jito LIFO workers
     let pipeline = arbitrage::spawn_workers(
         calc_ctx.clone(),
         metrics.clone(),
@@ -157,8 +165,17 @@ async fn async_main(config: config::Config) -> Result<()> {
         config.performance.queue_max_age_ms,
     );
 
+    // Stage 2: simulation workers (pop from sim_queue → classify → push to pipeline)
+    arbitrage::spawn_sim_workers(
+        sim_queue,
+        pipeline.clone(),
+        metrics.clone(),
+        sim_worker_count,
+        config.performance.queue_max_age_ms,
+    );
+
     eprintln!(
-        "scanner ready | tokens={} | pairs_per_scan={} | calc_workers={worker_count} | jito_capacity_per_sec={jito_capacity} | quote_concurrency={}",
+        "scanner ready | tokens={} | pairs_per_scan={} | calc_workers={worker_count} | sim_workers={sim_worker_count} | jito_capacity_per_sec={jito_capacity} | quote_concurrency={}",
         token_mints.len(),
         {
             let steps = ((config.trading.max_amount_sol - config.trading.min_amount_sol)
@@ -174,7 +191,6 @@ async fn async_main(config: config::Config) -> Result<()> {
             &token_mints,
             &config,
             &calc_ctx,
-            &pipeline,
             &metrics,
             &token_metrics,
         )

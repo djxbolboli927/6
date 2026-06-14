@@ -16,6 +16,7 @@ use crate::jito_grpc::JitoGrpcClient;
 use crate::metis::{MetisClient, QuoteResponse, SwapInstructionsResponse};
 use crate::metrics::Metrics;
 use crate::rate_limiter::RateLimiter;
+use crate::sim;
 use crate::token_metrics::TokenMetrics;
 use crate::tokens::WSOL_MINT;
 use crate::transaction::{self, AltLookup};
@@ -55,35 +56,6 @@ fn route_labels(route_plan: &serde_json::Value) -> Vec<String> {
 fn route_labels_summary(route_plan: &serde_json::Value) -> String {
     let labels = route_labels(route_plan);
     serde_json::to_string(&labels).unwrap_or_else(|_| "[]".to_string())
-}
-
-fn route_group_key(
-    route_plan: &serde_json::Value,
-    route_sig: u128,
-    hop_count: usize,
-    only_direct: bool,
-) -> String {
-    let hops = route_plan
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|hop| hop.get("swapInfo").and_then(|swap_info| swap_info.as_object()))
-        .map(|swap_info| {
-            serde_json::json!({
-                "label": swap_info.get("label").cloned().unwrap_or(serde_json::Value::Null),
-                "ammKey": swap_info.get("ammKey").cloned().unwrap_or(serde_json::Value::Null),
-                "inputMint": swap_info.get("inputMint").cloned().unwrap_or(serde_json::Value::Null),
-                "outputMint": swap_info.get("outputMint").cloned().unwrap_or(serde_json::Value::Null),
-            })
-        })
-        .collect::<Vec<_>>();
-    serde_json::json!({
-        "route_sig": format!("{route_sig:032x}"),
-        "hop_count": hop_count,
-        "only_direct": only_direct,
-        "hops": hops,
-    })
-    .to_string()
 }
 
 /// Returns true if both quotes share at least one pool (round-trip always loses).
@@ -161,7 +133,6 @@ struct SwapCandidate {
     hop_count: usize,
     only_direct: bool,
     route_sig: u128,
-    route_key: String,
     route_labels: String,
     min_wsol_gain: u64,
     created_at: Instant,
@@ -264,13 +235,31 @@ pub struct CalcCtx {
     pub cu_limits: Vec<u32>,
     pub user_pubkey: String,
     pub swap_ix_state: Arc<SwapIxState>,
+    /// All candidates with successful Metis instructions are pushed here.
+    pub sim_queue: Arc<sim::SimQueue>,
 }
 
 // ─── Pipeline handle ──────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct Pipeline {
     lifo: Arc<Mutex<Vec<ReadyInstruction>>>,
     lifo_sem: Arc<tokio::sync::Semaphore>,
+}
+
+impl Pipeline {
+    /// Push a ready instruction into the LIFO queue.
+    fn push(&self, item: ReadyInstruction, metrics: &Metrics) {
+        let route_sig = item.route_sig;
+        let route_labels = item.route_labels.clone();
+        self.lifo.lock().unwrap().push(item);
+        metrics.queue_in.fetch_add(1, Ordering::Relaxed);
+        let depth = metrics.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+        eprintln!(
+            "[queue_push] route_sig={route_sig:032x} route_labels={route_labels} queue_depth={depth}"
+        );
+        self.lifo_sem.add_permits(1);
+    }
 }
 
 // ─── Stage 1: Quote scanner ───────────────────────────────────────────────────
@@ -372,7 +361,7 @@ async fn quote_check(
     })
 }
 
-// ─── Worker pool ──────────────────────────────────────────────────────────────
+// ─── Stage 3: Jito workers ────────────────────────────────────────────────────
 
 pub fn spawn_workers(
     ctx: Arc<CalcCtx>,
@@ -504,121 +493,83 @@ pub fn spawn_workers(
     Pipeline { lifo, lifo_sem }
 }
 
-// ─── Queue helper ─────────────────────────────────────────────────────────────
+// ─── Stage 2: Simulation workers ─────────────────────────────────────────────
 
-fn push_to_queue(
-    swap_ixs: SwapInstructionsResponse,
-    hop_count: usize,
-    min_wsol_gain: u64,
-    route_sig: u128,
-    route_labels: String,
-    lifo: &Mutex<Vec<ReadyInstruction>>,
-    lifo_sem: &tokio::sync::Semaphore,
-    metrics: &Metrics,
+/// Spawn simulation workers that pop from sim_queue, classify venues,
+/// run the simulation stub, log results, then forward to the Jito LIFO queue.
+pub fn spawn_sim_workers(
+    sim_queue: Arc<sim::SimQueue>,
+    pipeline: Pipeline,
+    metrics: Arc<Metrics>,
+    worker_count: usize,
+    queue_max_age_ms: u64,
 ) {
-    let item = ReadyInstruction {
-        swap_ixs,
-        hop_count,
-        min_wsol_gain,
-        route_sig,
-        route_labels: route_labels.clone(),
-        arrived_at: Instant::now(),
-        waited_for_slot: false,
-    };
-    lifo.lock().unwrap().push(item);
-    metrics.queue_in.fetch_add(1, Ordering::Relaxed);
-    let queue_depth = metrics.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
-    eprintln!(
-        "[queue_push] route_sig={route_sig:032x} route_labels={route_labels} queue_depth={queue_depth}"
-    );
-    lifo_sem.add_permits(1);
+    for _ in 0..worker_count {
+        let sim_q = sim_queue.clone();
+        let pipe = pipeline.clone();
+        let met = metrics.clone();
+        tokio::spawn(async move {
+            loop {
+                let req = sim_q.pop().await;
+
+                if req.arrived_at.elapsed().as_millis() as u64 > queue_max_age_ms {
+                    eprintln!(
+                        "[sim_stale] route_sig={:032x} labels={}",
+                        req.route_sig, req.route_labels
+                    );
+                    met.sim_stale.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
+                // Phase 1: classify venues and log. Phase 2 will execute LiteSVM.
+                let result = sim::simulate_stub(&req);
+
+                met.sim_classified.fetch_add(1, Ordering::Relaxed);
+
+                if !result.unsupported_venues.is_empty() {
+                    met.sim_unsupported.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "[sim_unsupported_venue] route_sig={:032x} venues=[{}]",
+                        result.route_sig,
+                        result.unsupported_venues.join(",")
+                    );
+                }
+
+                eprintln!(
+                    "[sim_classify] route_sig={:032x} sim_kind={} hops=[{}] elapsed_us={}",
+                    result.route_sig,
+                    result.sim_kind,
+                    result.logs.join(","),
+                    result.elapsed_us,
+                );
+
+                // Phase 1: forward ALL candidates to Jito regardless of sim result.
+                // Phase 2 will gate on result.success here.
+                pipe.push(
+                    ReadyInstruction {
+                        swap_ixs: req.instructions,
+                        hop_count: req.hop_count,
+                        min_wsol_gain: req.min_wsol_gain,
+                        route_sig: req.route_sig,
+                        route_labels: req.route_labels,
+                        arrived_at: req.arrived_at,
+                        waited_for_slot: false,
+                    },
+                    &met,
+                );
+            }
+        });
+    }
 }
 
-fn flush_candidate_batch(
-    candidates: &mut Vec<SwapCandidate>,
-    config: &Config,
-    ctx: &Arc<CalcCtx>,
-    pipeline: &Pipeline,
-    metrics: &Arc<Metrics>,
-) {
-    if candidates.is_empty() {
-        return;
-    }
+// ─── Stage 1.5: Metis instruction fetch ──────────────────────────────────────
 
-    let top_per_route = config.performance.candidate_top_per_route.max(1);
-    let global_top_n = config.performance.candidate_global_top_n.max(1);
-
-    let mut groups: HashMap<String, Vec<SwapCandidate>> = HashMap::new();
-    for candidate in candidates.drain(..) {
-        groups
-            .entry(candidate.route_key.clone())
-            .or_default()
-            .push(candidate);
-    }
-
-    let mut selected = Vec::new();
-    let mut dropped_by_rank = 0usize;
-    let mut coalesced = 0usize;
-    for (_route_key, mut group) in groups {
-        group.sort_by(|a, b| b.net_profit_estimate.cmp(&a.net_profit_estimate));
-        let group_len = group.len();
-        let kept = group_len.min(top_per_route);
-        let route_sig = group.first().map(|c| c.route_sig).unwrap_or(0);
-        let best_profit = group.first().map(|c| c.net_profit_estimate).unwrap_or(0);
-        let labels = group.first().map(|c| c.route_labels.as_str()).unwrap_or("[]");
-        eprintln!(
-            "[route_coalesce] route_sig={route_sig:032x} labels={labels} candidates={group_len} kept={kept} best_profit={best_profit}"
-        );
-        if group_len > kept {
-            coalesced += group_len - kept;
-            dropped_by_rank += group_len - kept;
-            group.truncate(kept);
-        }
-        selected.extend(group);
-    }
-
-    selected.sort_by(|a, b| b.net_profit_estimate.cmp(&a.net_profit_estimate));
-    if selected.len() > global_top_n {
-        dropped_by_rank += selected.len() - global_top_n;
-        selected.truncate(global_top_n);
-    }
-
-    metrics
-        .candidate_coalesced_total
-        .fetch_add(coalesced as u64, Ordering::Relaxed);
-    metrics
-        .candidate_dropped_rank_total
-        .fetch_add(dropped_by_rank as u64, Ordering::Relaxed);
-
-    let timeout_ms = config.performance.swap_instructions_timeout_ms;
-    let mut dropped_by_inflight = 0usize;
-    let mut dropped_by_budget = 0usize;
-    let mut sent_to_metis = 0usize;
-    for candidate in selected {
-        match spawn_fresh_metis_candidate(
-            candidate,
-            ctx.clone(),
-            Arc::clone(&pipeline.lifo),
-            Arc::clone(&pipeline.lifo_sem),
-            metrics.clone(),
-            timeout_ms,
-        ) {
-            SwapIxDispatchOutcome::Sent => sent_to_metis += 1,
-            SwapIxDispatchOutcome::DroppedInflight => dropped_by_inflight += 1,
-            SwapIxDispatchOutcome::DroppedBudget => dropped_by_budget += 1,
-        }
-    }
-
-    eprintln!(
-        "[flush_batch] sent={sent_to_metis} drop_inflight={dropped_by_inflight} drop_budget={dropped_by_budget}"
-    );
-}
-
+/// Dispatch a candidate to fetch /swap-instructions from Metis.
+/// On success the SimulationRequest is pushed to ctx.sim_queue.
+/// No ranking is applied — ALL profitable candidates are dispatched.
 fn spawn_fresh_metis_candidate(
     candidate: SwapCandidate,
     ctx: Arc<CalcCtx>,
-    lifo: Arc<Mutex<Vec<ReadyInstruction>>>,
-    sem: Arc<Semaphore>,
     metrics: Arc<Metrics>,
     timeout_ms: u64,
 ) -> SwapIxDispatchOutcome {
@@ -691,8 +642,6 @@ fn spawn_fresh_metis_candidate(
                             spawn_fresh_metis_candidate(
                                 pending,
                                 ctx.clone(),
-                                lifo.clone(),
-                                sem.clone(),
                                 metrics.clone(),
                                 timeout_ms,
                             );
@@ -702,7 +651,7 @@ fn spawn_fresh_metis_candidate(
                 };
 
                 eprintln!(
-                    "[fresh_metis_ok] route_sig={route_sig:032x} elapsed_ms={fetch_ms} setup_ix={} swap_ix=1 cleanup_ix={} alts={} action=queue_push",
+                    "[fresh_metis_ok] route_sig={route_sig:032x} elapsed_ms={fetch_ms} setup_ix={} swap_ix=1 cleanup_ix={} alts={} action=sim_queue",
                     swap_ixs.setup_instructions.len(),
                     if swap_ixs.cleanup_instruction.is_some() { 1 } else { 0 },
                     swap_ixs.address_lookup_table_addresses.len()
@@ -711,24 +660,24 @@ fn spawn_fresh_metis_candidate(
                 metrics.metis_fetch_samples.fetch_add(1, Ordering::Relaxed);
                 metrics.swap_ix_ok.fetch_add(1, Ordering::Relaxed);
 
-                push_to_queue(
-                    swap_ixs,
-                    candidate.hop_count,
-                    candidate.min_wsol_gain,
+                // Push to simulation queue — not directly to Jito.
+                ctx.sim_queue.push(sim::SimulationRequest {
                     route_sig,
-                    candidate.route_labels.clone(),
-                    &lifo,
-                    &sem,
-                    &metrics,
-                );
+                    route_labels: candidate.route_labels.clone(),
+                    hop_count: candidate.hop_count,
+                    min_wsol_gain: candidate.min_wsol_gain,
+                    net_profit_estimate: candidate.net_profit_estimate,
+                    instructions: swap_ixs,
+                    merged_quote: candidate.merged.clone(),
+                    arrived_at: Instant::now(),
+                });
+                metrics.sim_queued.fetch_add(1, Ordering::Relaxed);
 
                 drop(permit);
                 if let Some(pending) = ctx.swap_ix_state.complete(route_sig) {
                     spawn_fresh_metis_candidate(
                         pending,
                         ctx.clone(),
-                        lifo.clone(),
-                        sem.clone(),
                         metrics.clone(),
                         timeout_ms,
                     );
@@ -762,13 +711,44 @@ fn spawn_fresh_metis_candidate(
     }
 }
 
+/// Dispatch ALL candidates in the batch to Metis instruction fetch.
+/// No ranking or coalescing is applied — every profitable candidate that
+/// passes the same-pool and merge checks is sent to /swap-instructions.
+fn flush_candidate_batch(
+    candidates: &mut Vec<SwapCandidate>,
+    config: &Config,
+    ctx: &Arc<CalcCtx>,
+    metrics: &Arc<Metrics>,
+) {
+    if candidates.is_empty() {
+        return;
+    }
+
+    let timeout_ms = config.performance.swap_instructions_timeout_ms;
+    let total = candidates.len();
+    let mut dispatched = 0usize;
+    let mut dropped_by_inflight = 0usize;
+    let mut dropped_by_budget = 0usize;
+
+    for candidate in candidates.drain(..) {
+        match spawn_fresh_metis_candidate(candidate, ctx.clone(), metrics.clone(), timeout_ms) {
+            SwapIxDispatchOutcome::Sent => dispatched += 1,
+            SwapIxDispatchOutcome::DroppedInflight => dropped_by_inflight += 1,
+            SwapIxDispatchOutcome::DroppedBudget => dropped_by_budget += 1,
+        }
+    }
+
+    eprintln!(
+        "[flush_batch] total={total} dispatched={dispatched} drop_inflight={dropped_by_inflight} drop_budget={dropped_by_budget}"
+    );
+}
+
 // ─── Main scan entry ─────────────────────────────────────────────────────────
 
 pub async fn scan_all_tokens(
     token_mints: &[String],
     config: &Config,
     ctx: &Arc<CalcCtx>,
-    pipeline: &Pipeline,
     metrics: &Arc<Metrics>,
     token_metrics: &Arc<TokenMetrics>,
 ) -> Result<()> {
@@ -845,7 +825,6 @@ pub async fn scan_all_tokens(
         let sig = compute_route_sig(&merged.route_plan);
         let min_wsol_gain = on_chain_floor.saturating_sub(amount);
         let route_labels = route_labels_summary(&merged.route_plan);
-        let route_key = route_group_key(&merged.route_plan, sig, hop_count, pair.only_direct);
 
         if candidate_batch.is_empty() {
             candidate_batch_started = Instant::now();
@@ -858,7 +837,6 @@ pub async fn scan_all_tokens(
             hop_count,
             only_direct: pair.only_direct,
             route_sig: sig,
-            route_key,
             route_labels,
             min_wsol_gain,
             created_at: Instant::now(),
@@ -868,12 +846,12 @@ pub async fn scan_all_tokens(
             .fetch_add(1, Ordering::Relaxed);
 
         if candidate_batch_started.elapsed() >= candidate_batch_window {
-            flush_candidate_batch(&mut candidate_batch, config, ctx, pipeline, metrics);
+            flush_candidate_batch(&mut candidate_batch, config, ctx, metrics);
             candidate_batch_started = Instant::now();
         }
     }
 
-    flush_candidate_batch(&mut candidate_batch, config, ctx, pipeline, metrics);
+    flush_candidate_batch(&mut candidate_batch, config, ctx, metrics);
 
     Ok(())
 }

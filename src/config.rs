@@ -133,10 +133,14 @@ pub struct PerformanceConfig {
     #[serde(default = "default_candidate_batch_window_ms")]
     pub candidate_batch_window_ms: u64,
     /// Keep at most this many profitable candidates per route signature.
+    /// Note: ranking is disabled in the current pipeline; this field is reserved.
     #[serde(default = "default_candidate_top_per_route")]
+    #[allow(dead_code)]
     pub candidate_top_per_route: usize,
     /// Keep at most this many candidates globally per micro-batch.
+    /// Note: ranking is disabled in the current pipeline; this field is reserved.
     #[serde(default = "default_candidate_global_top_n")]
+    #[allow(dead_code)]
     pub candidate_global_top_n: usize,
     /// Hard cap for concurrent /swap-instructions requests.
     #[serde(default = "default_max_concurrent_swap_instructions")]
@@ -159,6 +163,11 @@ pub struct PerformanceConfig {
     /// Metis responses; lower to discard stale opportunities faster.
     #[serde(default = "default_queue_max_age_ms")]
     pub queue_max_age_ms: u64,
+    /// Number of concurrent simulation workers (Stage 2).
+    /// Each worker pops from simulation_queue, classifies venues, and forwards
+    /// to the Jito LIFO queue. Default 4.
+    #[serde(default = "default_sim_workers")]
+    pub sim_workers: usize,
     #[serde(default)]
     pub bot_cpu_cores: Vec<usize>,
 }
@@ -181,6 +190,10 @@ fn default_candidate_global_top_n() -> usize {
 
 fn default_max_concurrent_swap_instructions() -> usize {
     32
+}
+
+fn default_sim_workers() -> usize {
+    4
 }
 
 fn default_swap_instructions_timeout_ms() -> u64 {

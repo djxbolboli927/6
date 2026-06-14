@@ -18,7 +18,11 @@ pub struct Metrics {
     pub swap_ix_network: AtomicU64,
     pub swap_ix_parse: AtomicU64,
     pub candidate_profitable_total: AtomicU64,
+    /// Reserved — ranking disabled; will always be zero.
+    #[allow(dead_code)]
     pub candidate_coalesced_total: AtomicU64,
+    /// Reserved — ranking disabled; will always be zero.
+    #[allow(dead_code)]
     pub candidate_dropped_rank_total: AtomicU64,
     pub candidate_dropped_inflight_total: AtomicU64,
     pub swap_ix_budget_dropped_total: AtomicU64,
@@ -30,14 +34,24 @@ pub struct Metrics {
     pub queue_in: AtomicU64,
     pub queue_depth: AtomicI64,
 
-    // ── Stage 2: worker processing ────────────────────────────────────────────
+    // ── Stage 2: simulation ───────────────────────────────────────────────────
+    /// Candidates pushed into the simulation queue.
+    pub sim_queued: AtomicU64,
+    /// Candidates that completed venue classification (Phase 1).
+    pub sim_classified: AtomicU64,
+    /// Candidates with at least one unsupported venue.
+    pub sim_unsupported: AtomicU64,
+    /// Candidates dropped from sim_queue as stale (age > queue_max_age_ms).
+    pub sim_stale: AtomicU64,
+
+    // ── Stage 3: worker processing ────────────────────────────────────────────
     pub dropped_stale: AtomicU64,
     pub tx_build_failed: AtomicU64,
     pub tx_too_large: AtomicU64,
     pub dropped_account_locks: AtomicU64,
     pub calc_done: AtomicU64,
 
-    // ── Stage 3: Jito send ────────────────────────────────────────────────────
+    // ── Stage 4: Jito send ────────────────────────────────────────────────────
     pub rate_requeued: AtomicU64,
     pub jito_send_failed: AtomicU64,
     pub jito_sent: AtomicU64,
@@ -67,6 +81,10 @@ impl Metrics {
             swap_ix_sent_total: AtomicU64::new(0),
             queue_in: AtomicU64::new(0),
             queue_depth: AtomicI64::new(0),
+            sim_queued: AtomicU64::new(0),
+            sim_classified: AtomicU64::new(0),
+            sim_unsupported: AtomicU64::new(0),
+            sim_stale: AtomicU64::new(0),
             dropped_stale: AtomicU64::new(0),
             tx_build_failed: AtomicU64::new(0),
             tx_too_large: AtomicU64::new(0),
@@ -104,12 +122,15 @@ impl Metrics {
                 let sf_net    = m.swap_ix_network.swap(0, Ordering::Relaxed);
                 let sf_parse  = m.swap_ix_parse.swap(0, Ordering::Relaxed);
                 let cand_total = m.candidate_profitable_total.swap(0, Ordering::Relaxed);
-                let cand_coalesced = m.candidate_coalesced_total.swap(0, Ordering::Relaxed);
-                let cand_rank_drop = m.candidate_dropped_rank_total.swap(0, Ordering::Relaxed);
                 let cand_inflight_drop = m.candidate_dropped_inflight_total.swap(0, Ordering::Relaxed);
                 let swap_budget_drop = m.swap_ix_budget_dropped_total.swap(0, Ordering::Relaxed);
                 let swap_sent_total = m.swap_ix_sent_total.swap(0, Ordering::Relaxed);
                 let q_in      = m.queue_in.swap(0, Ordering::Relaxed);
+
+                let sim_q     = m.sim_queued.swap(0, Ordering::Relaxed);
+                let sim_cls   = m.sim_classified.swap(0, Ordering::Relaxed);
+                let sim_unsup = m.sim_unsupported.swap(0, Ordering::Relaxed);
+                let sim_st    = m.sim_stale.swap(0, Ordering::Relaxed);
 
                 let stale     = m.dropped_stale.swap(0, Ordering::Relaxed);
                 let build     = m.tx_build_failed.swap(0, Ordering::Relaxed);
@@ -136,7 +157,8 @@ impl Metrics {
                     "[{WINDOW_SECS}s] \
 metis_sent={sent} routes={routes} quoted_profitable={profit}\n  \
   FUNNEL    : profitable={profit}  drop_same_pool={drop_pool}  drop_multi_hop={drop_hop}  drop_merge={drop_merge}  drop_no_serve={drop_no_srv}  -> swap_ix_ok={sw_ok}\n  \
-  CANDIDATE : admitted={cand_total}  coalesced={cand_coalesced}  drop_rank={cand_rank_drop}  drop_inflight={cand_inflight_drop}  swap_budget_drop={swap_budget_drop}  swap_sent={swap_sent_total}\n  \
+  CANDIDATE : admitted={cand_total}  drop_inflight={cand_inflight_drop}  swap_budget_drop={swap_budget_drop}  swap_sent={swap_sent_total}\n  \
+  SIM-QUEUE : queued={sim_q}  classified={sim_cls}  unsupported_venue={sim_unsup}  stale={sim_st}\n  \
 PRE-QUEUE : swap_ix_ok={sw_ok}  swap_ix_fail={swap_fail} [timeout={sf_to} http={sf_http} net={sf_net} parse={sf_parse}] -> queue_in={q_in}  (depth_now={depth})\n  \
   IN-QUEUE  : stale={stale} (waited >{ttl_secs}s)\n  \
   TX-BUILD  : build_fail={build}  too_large={too_big}  too_many_locks={too_locks}  calc_ok={calc}\n  \
