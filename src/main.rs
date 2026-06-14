@@ -8,6 +8,7 @@ mod metis;
 mod metrics;
 mod rate_limiter;
 mod sim;
+mod solfi_sim;
 mod token_metrics;
 mod tokens;
 mod transaction;
@@ -126,6 +127,8 @@ async fn async_main(config: config::Config) -> Result<()> {
         (None, None)
     };
 
+    let solfi_cache = solfi_sim::SolFiAccountCache::new(config.rpc.url.clone());
+
     let blockhash_cache = Arc::new(BlockhashCache::new(rpc_client.clone()));
 
     // Simulation queue: sits between Metis instruction fetch and Jito send.
@@ -172,6 +175,7 @@ async fn async_main(config: config::Config) -> Result<()> {
         metrics.clone(),
         sim_worker_count,
         config.performance.queue_max_age_ms,
+        solfi_cache,
     );
 
     eprintln!(

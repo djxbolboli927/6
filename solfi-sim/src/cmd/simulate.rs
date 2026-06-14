@@ -163,3 +163,78 @@ pub struct SwapResult {
     pub out_amount: Option<f64>,
     pub error: Option<String>,
 }
+
+/// Simulate a SolFi swap using pre-loaded accounts (fresh from RPC).
+/// Returns the output token amount in atomic units.
+pub fn simulate_with_accounts(
+    accounts: &[(solana_pubkey::Pubkey, solana_account::Account)],
+    market: solana_pubkey::Pubkey,
+    direction: SwapDirection,
+    amount_in: u64,
+    slot: Option<u64>,
+) -> eyre::Result<u64> {
+    const SOLFI_PROGRAM_BYTES: &[u8] = include_bytes!("../../data/solfi.so");
+
+    let user_keypair = Keypair::new();
+    let user = user_keypair.pubkey();
+    let mut svm = LiteSVM::new()
+        .with_sysvars()
+        .with_precompiles()
+        .with_sigverify(true)
+        .with_spl_programs();
+
+    for (pubkey, account) in accounts {
+        svm.set_account(*pubkey, account.clone())?;
+    }
+    svm.add_program(SOLFI_PROGRAM, SOLFI_PROGRAM_BYTES);
+
+    if let Some(s) = slot {
+        svm.warp_to_slot(s);
+    }
+
+    let to_mint = match direction {
+        SwapDirection::SolToUsdc => &USDC,
+        SwapDirection::UsdcToSol => &WSOL,
+    };
+
+    let fee_lamports = sol_to_lamports(1.0);
+    match direction {
+        SwapDirection::SolToUsdc => {
+            svm.airdrop(&user, amount_in + fee_lamports)
+                .map_err(|e| eyre!("airdrop failed: {}", e.err))?;
+        }
+        SwapDirection::UsdcToSol => {
+            svm.airdrop(&user, fee_lamports)
+                .map_err(|e| eyre!("airdrop failed: {}", e.err))?;
+            let usdc_ata = get_associated_token_address(&user, &USDC);
+            svm.set_account(usdc_ata, mk_ata_account(&USDC, &user, amount_in))?;
+        }
+    }
+
+    let wsol_ata = get_associated_token_address(&user, &WSOL);
+    let to_ata = get_associated_token_address(&user, to_mint);
+    let balance_before = token_balance(&svm, &to_ata);
+
+    let mut instructions = vec![
+        create_associated_token_account_idempotent(&user, &user, &WSOL, &spl_token::id()),
+        create_associated_token_account_idempotent(&user, &user, &USDC, &spl_token::id()),
+    ];
+
+    if direction == SwapDirection::SolToUsdc {
+        instructions.extend([
+            transfer(&user, &wsol_ata, amount_in),
+            sync_native(&spl_token::id(), &wsol_ata)?,
+        ]);
+    }
+
+    instructions.push(create_swap_ix(direction, &market, &user, &WSOL, &USDC, amount_in));
+
+    let tx = Transaction::new_with_payer(&instructions, Some(&user));
+    let signed_tx = Transaction::new(&[&user_keypair], tx.message, svm.latest_blockhash());
+
+    svm.send_transaction(signed_tx)
+        .map_err(|e| eyre!("sim tx failed: {}", e.err))?;
+
+    let balance_after = token_balance(&svm, &to_ata);
+    Ok(balance_after.saturating_sub(balance_before))
+}

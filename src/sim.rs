@@ -39,7 +39,7 @@ pub fn classify_venue(label: &str) -> SimulationVenueKind {
         // ── Prop AMMs (LiteSVM / pmm-sim) ─────────────────────────────────────
         "bisonfi"
         | "humidifi" | "humidifiv1" | "humidifiv2" | "humidifiv3"
-        | "solfiv2"
+        | "solfi" | "solfiv2"
         | "obricv2"
         | "zerofi"
         | "tesserav"
@@ -162,8 +162,6 @@ impl SimQueue {
 // The function below is Phase 1: it classifies venues and returns structured
 // metadata but does NOT execute a simulation.
 //
-// TODO Phase 2: for PropAmmPmmSim venues, run the Metis swap instruction in
-//   LiteSVM with on-demand RPC account fetching (pmm-sim approach).
 // TODO Phase 3: for ManualAmmAdapter venues, implement per-AMM mathematical
 //   swap adapters (constant-product, concentrated-liquidity, DLMM, etc.).
 
@@ -212,4 +210,43 @@ pub fn simulate_stub(req: &SimulationRequest) -> SimulationResult {
         sim_kind: sim_kind.to_string(),
         elapsed_us: t.elapsed().as_micros() as u64,
     }
+}
+
+// ─── Phase 2: SolFi LiteSVM simulation ───────────────────────────────────────
+//
+// Extends simulate_stub with real SolFi swap simulation via LiteSVM.
+// SolFi hops are detected in the route_plan, simulated with fresh accounts
+// from the SolFiAccountCache, and the results are logged.
+// Phase 2 still forwards ALL candidates to Jito — Phase 3 will gate on results.
+
+pub fn simulate(
+    req: &SimulationRequest,
+    solfi_cache: &Arc<crate::solfi_sim::SolFiAccountCache>,
+) -> SimulationResult {
+    let mut result = simulate_stub(req);
+
+    // Attempt SolFi simulation if a fresh snapshot is available.
+    if let Some(snapshot) = solfi_cache.get_snapshot() {
+        let hop_results =
+            crate::solfi_sim::simulate_solfi_hops(&snapshot, &req.merged_quote.route_plan);
+        if !hop_results.is_empty() {
+            for hop in &hop_results {
+                if hop.success {
+                    result.logs.push(format!(
+                        "[solfi_sim_ok] market={} amount_in={} amount_out={}",
+                        hop.market, hop.amount_in, hop.amount_out
+                    ));
+                } else {
+                    result.logs.push(format!(
+                        "[solfi_sim_err] market={} amount_in={} error={}",
+                        hop.market,
+                        hop.amount_in,
+                        hop.error.as_deref().unwrap_or("unknown")
+                    ));
+                }
+            }
+        }
+    }
+
+    result
 }

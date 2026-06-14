@@ -496,18 +496,21 @@ pub fn spawn_workers(
 // ─── Stage 2: Simulation workers ─────────────────────────────────────────────
 
 /// Spawn simulation workers that pop from sim_queue, classify venues,
-/// run the simulation stub, log results, then forward to the Jito LIFO queue.
+/// run the simulation (with Phase 2 SolFi LiteSVM execution), log results,
+/// then forward to the Jito LIFO queue.
 pub fn spawn_sim_workers(
     sim_queue: Arc<sim::SimQueue>,
     pipeline: Pipeline,
     metrics: Arc<Metrics>,
     worker_count: usize,
     queue_max_age_ms: u64,
+    solfi_cache: Arc<crate::solfi_sim::SolFiAccountCache>,
 ) {
     for _ in 0..worker_count {
         let sim_q = sim_queue.clone();
         let pipe = pipeline.clone();
         let met = metrics.clone();
+        let cache = solfi_cache.clone();
         tokio::spawn(async move {
             loop {
                 let req = sim_q.pop().await;
@@ -521,8 +524,8 @@ pub fn spawn_sim_workers(
                     continue;
                 }
 
-                // Phase 1: classify venues and log. Phase 2 will execute LiteSVM.
-                let result = sim::simulate_stub(&req);
+                // Phase 2: classify venues + run SolFi LiteSVM simulation.
+                let result = sim::simulate(&req, &cache);
 
                 met.sim_classified.fetch_add(1, Ordering::Relaxed);
 
@@ -543,8 +546,8 @@ pub fn spawn_sim_workers(
                     result.elapsed_us,
                 );
 
-                // Phase 1: forward ALL candidates to Jito regardless of sim result.
-                // Phase 2 will gate on result.success here.
+                // Phase 2: forward ALL candidates to Jito regardless of sim result.
+                // Phase 3 will gate on result.success here.
                 pipe.push(
                     ReadyInstruction {
                         swap_ixs: req.instructions,
