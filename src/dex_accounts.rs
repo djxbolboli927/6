@@ -1,28 +1,19 @@
-//! Pool account registry.
+//! Pool account registry — RPC-first.
 //!
-//! Reads `<dex_dir>/<DEX_NAME>/<pool>.toml` files at startup and returns:
-//!   - `all_accounts` — every static pubkey to pre-fetch via RPC so the sim
-//!     cache is fully populated before the first trade
-//!   - `subscribe_accounts` — vault accounts that change on every swap and
-//!     must be subscribed individually on Yellowstone for live updates
-//!     (the Yellowstone owner-filter already covers accounts owned by DEX
-//!     programs; vaults are owned by SPL Token and need a direct subscription)
-//!
-//! Directory layout:
-//!   dex_dir/
-//!     Goonfi_V2/
-//!       hype_usdc.toml
-//!       wsol_usdc.toml
-//!     SomeOtherDex/
-//!       ...
-//!
-//! Files starting with `_` (e.g. `_template.toml`) are skipped.
+//! `load_pools_by_dex_dir` reads `pools_by_dex/*.json` (on-chain-derived pool
+//! definitions) and returns the three account lists the simulator needs:
+//!   - `all_accounts`       — every pool account to pre-fetch via RPC at startup
+//!   - `subscribe_accounts` — volatile accounts (vaults, oracle state, …) that
+//!                             must be subscribed to Yellowstone for live updates
+//!   - `prefetch_groups`    — one group per pool for rate-limited RPC warm-up
+//!   - `alt_accounts`       — ALT addresses to load into AltCache
 
 use serde::Deserialize;
 use solana_sdk::pubkey::Pubkey;
 use std::path::Path;
 use tracing::{info, warn};
 
+#[allow(dead_code)]
 #[derive(Deserialize)]
 struct PoolFile {
     name: Option<String>,
@@ -51,6 +42,7 @@ pub struct DexPools {
 
 /// Load all pool files from `dex_dir/<DEX>/<pool>.toml`.
 /// Returns an empty `DexPools` if the directory does not exist.
+#[allow(dead_code)]
 pub fn load(dex_dir: &str) -> DexPools {
     let dex_path = Path::new(dex_dir);
     if !dex_path.exists() {
@@ -191,6 +183,7 @@ pub fn load(dex_dir: &str) -> DexPools {
     }
 }
 
+#[allow(dead_code)]
 fn load_mix_json(path: &Path) -> DexPools {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,

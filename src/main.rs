@@ -243,75 +243,18 @@ async fn async_main(config: config::Config) -> Result<()> {
             eprintln!("[sim_clock_seed] slot={} unix_timestamp={}", s, ts);
         }
 
-        let dex_pools = dex_accounts::load(&config.simulation.dex_dir);
-        let mix_registry = mix_registry::VerifiedMixRegistry::load_and_verify(
-            rpc_client.clone(),
-            &config.simulation.dex_dir,
-            config.simulation.prefetch_pools_per_second,
-            &config.rpc.url,
-        )
-        .await?;
-        if let Some(registry) = &mix_registry {
-            let alt_cache_path = registry.output_root().join("alt_accounts_cache.json");
-            alt_cache.load_from_disk(&alt_cache_path)?;
-            let mix_alts = registry.alt_accounts();
-            alt_cache
-                .prefetch_missing_rate_limited(
-                    &mix_alts,
-                    rpc_client.clone(),
-                    config.simulation.prefetch_pools_per_second,
-                )
-                .await;
-
-            metrics.invalid_mix_accounts.fetch_add(
-                registry.invalid_account_count() as u64,
-                Ordering::Relaxed,
-            );
-            metrics.invalid_mix_pools.fetch_add(
-                (registry.invalid_pool_count() + registry.unverified_pool_count()) as u64,
-                Ordering::Relaxed,
-            );
-            registry.spawn_unverified_retry_task(
-                rpc_client.clone(),
-                config.simulation.prefetch_pools_per_second,
-            );
-        }
-
-        let mut sim_all_accounts = dex_pools.all_accounts.clone();
-        let mut sim_subscribe_accounts = dex_pools.subscribe_accounts.clone();
-        let mut sim_prefetch_groups = dex_pools.prefetch_groups.clone();
-        if let Some(registry) = &mix_registry {
-            registry.filter_valid_accounts(&mut sim_all_accounts);
-            registry.filter_valid_accounts(&mut sim_subscribe_accounts);
-            sim_subscribe_accounts.extend(registry.valid_variable_accounts());
-            sim_subscribe_accounts.sort_unstable();
-            sim_subscribe_accounts.dedup();
-            sim_prefetch_groups = registry.filter_valid_groups(&sim_prefetch_groups);
-        }
-
-        // Load ALL pool accounts from pools_by_dex/*.json as the authoritative
-        // source for the 713+ fixed pools.  This is done AFTER mix_registry
-        // filtering so these accounts are never removed.
-        //
-        // Classification inside load_pools_by_dex_dir:
-        //   - tokenAccountA/B + DEX-specific volatile state → subscribe (Yellowstone)
-        //   - mints, authority PDAs                         → prefetch (RPC only)
-        //   - addressLookupTableAddress                     → alt_accounts (AltCache)
-        //
-        // This replaces the old approach of only loading vaults A/B: every
-        // DEX-specific writable account (oracle, observationState, globalVault,
-        // tickmap, etc.) is now also subscribed so the sim cache stays current.
+        // ── RPC-first: load all pool accounts from pools_by_dex/*.json ─────────
+        // pools_by_dex/*.json is the on-chain-derived source of truth for every
+        // active pool.  Accounts are fetched from RPC at startup (below) and kept
+        // fresh via Yellowstone gRPC.  mix.json and TOML pool config files are
+        // not required.
         let fixed_pools = dex_accounts::load_pools_by_dex_dir("pools_by_dex");
-        sim_all_accounts.extend_from_slice(&fixed_pools.all_accounts);
-        sim_all_accounts.sort_unstable();
-        sim_all_accounts.dedup();
-        sim_subscribe_accounts.extend_from_slice(&fixed_pools.subscribe_accounts);
-        sim_subscribe_accounts.sort_unstable();
-        sim_subscribe_accounts.dedup();
-        sim_prefetch_groups.extend(fixed_pools.prefetch_groups);
+        let sim_all_accounts = fixed_pools.all_accounts.clone();
+        let sim_subscribe_accounts = fixed_pools.subscribe_accounts.clone();
+        let sim_prefetch_groups = fixed_pools.prefetch_groups.clone();
 
-        // Pre-load ALT contents for every addressLookupTableAddress in pools_by_dex
-        // so v0 transactions that reference them can be resolved by the simulator.
+        // Load ALT contents for every addressLookupTableAddress so v0
+        // transactions can be resolved by the simulator.
         if !fixed_pools.alt_accounts.is_empty() {
             eprintln!(
                 "[pools_by_dex_alts] loading {} ALTs into alt_cache",
@@ -325,6 +268,8 @@ async fn async_main(config: config::Config) -> Result<()> {
                 )
                 .await;
         }
+
+        let mix_registry: Option<Arc<mix_registry::VerifiedMixRegistry>> = None;
 
         let mut live_extra = vec![wsol_ata];
         live_extra.extend_from_slice(&sim_subscribe_accounts);

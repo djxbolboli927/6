@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use solana_client::rpc_client::RpcClient;
