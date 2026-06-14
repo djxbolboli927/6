@@ -1,5 +1,5 @@
 use anyhow::Result;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -8,14 +8,13 @@ pub struct Config {
     pub trading: TradingConfig,
     pub jito: JitoConfig,
     pub rpc: RpcConfig,
-    pub yellowstone_grpc: YellowstoneGrpcConfig,
     pub performance: PerformanceConfig,
-    #[serde(default)]
-    pub simulation: SimulationConfig,
     #[serde(default)]
     pub jito_grpc: JitoGrpcConfig,
     #[serde(default)]
-    pub template_cache: TemplateCacheConfig,
+    pub yellowstone_grpc: YellowstoneGrpcConfig,
+    #[serde(default)]
+    pub pmm_sim: PmmSimConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -55,117 +54,12 @@ pub struct JitoConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct RpcConfig {
     pub url: String,
-    /// Commitment level for all RPC reads (account fetches, sim-compare,
-    /// retry snapshots). Must match the Yellowstone stream commitment
-    /// ("processed") so the cache and the RPC baseline see the same slot.
-    /// Using the default "finalized" makes every actively-traded pool look
-    /// stale because finalized lags the processed stream by ~30+ slots.
     #[serde(default = "default_rpc_commitment")]
     pub commitment: String,
-    /// Additional public RPC endpoints tried in order when the primary RPC
-    /// fails an account-fetch (`getMultipleAccounts`). These are ONLY used
-    /// for account data — never for blockhash, transaction simulation, or
-    /// Jito submission. Leave empty to disable fallback.
-    #[serde(default)]
-    pub fallback_rpc_urls: Vec<String>,
 }
 
 fn default_rpc_commitment() -> String {
     "processed".to_string()
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct YellowstoneGrpcConfig {
-    pub endpoint: String,
-    pub x_token: String,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct SimulationConfig {
-    /// If false, bot sends every profitable tx without any local sim gate
-    /// (pre-LiteSVM behaviour). Default: disabled so legacy configs keep
-    /// working until the operator opts in.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Directory containing the DEX .so binaries listed in `program_registry`.
-    #[serde(default = "default_so_dir")]
-    pub so_dir: String,
-    /// Directory containing per-pool account files (`dex/<DEX>/<pool>.toml`).
-    /// These are pre-fetched at startup and the vault accounts within are
-    /// subscribed for live Yellowstone updates.
-    #[serde(default = "default_dex_dir")]
-    pub dex_dir: String,
-    /// Canonical DEX keys kept for operator config compatibility and reporting.
-    /// With `simulation.enabled=true`, all routes are simulated regardless of
-    /// this list; missing programs/accounts fail closed instead of bypassing.
-    #[serde(default = "default_simulation_dexes", alias = "enabled_exchanges")]
-    pub enabled_dexes: Vec<String>,
-    /// When sim reverts or errors, `fail_closed=true` drops the send (safest);
-    /// `false` logs and forwards to Jito anyway (useful during rollout).
-    #[serde(default = "default_true")]
-    pub fail_closed: bool,
-    /// Number of INDEPENDENT Simulator instances to spin up. Each Simulator
-    /// owns its own `Mutex<LiteSVM>`, so N workers = N sims in parallel.
-    /// Sizing guidance: in steady state each sim takes ~2-5ms of CPU, so
-    /// `workers` should roughly equal the peak number of profitable
-    /// opportunities that arrive per 5ms window. In production, 8 is a
-    /// sensible default (handles ~1600 sims/sec with headroom).
-    #[serde(default = "default_workers")]
-    pub workers: usize,
-    /// Startup RPC warm-up rate. For mix.json this is interpreted as pools
-    /// per second because each pool group is fetched with getMultipleAccounts.
-    #[serde(default = "default_prefetch_pools_per_second")]
-    pub prefetch_pools_per_second: u64,
-    /// Production should keep this false: simulation may use cache/gRPC state,
-    /// but it must not wait on RPC in the hot path.
-    #[serde(default)]
-    pub allow_hot_path_rpc_fetch: bool,
-}
-
-impl Default for SimulationConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            so_dir: default_so_dir(),
-            dex_dir: default_dex_dir(),
-            enabled_dexes: default_simulation_dexes(),
-            fail_closed: true,
-            workers: default_workers(),
-            prefetch_pools_per_second: default_prefetch_pools_per_second(),
-            allow_hot_path_rpc_fetch: false,
-        }
-    }
-}
-
-fn default_so_dir() -> String {
-    "/home/soluser/m/so".to_string()
-}
-
-fn default_dex_dir() -> String {
-    "vendor/litesvm/dex".to_string()
-}
-
-fn default_simulation_dexes() -> Vec<String> {
-    vec![
-        "meteora_damm_v2".to_string(),
-        "meteora_dlmm".to_string(),
-        "raydium_amm_v4".to_string(),
-        "raydium_clmm".to_string(),
-        "raydium_cpmm".to_string(),
-        "whirlpool".to_string(),
-    ]
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_workers() -> usize {
-    8
-}
-
-fn default_prefetch_pools_per_second() -> u64 {
-    5
 }
 
 /// Second Jito submission path via SearcherService gRPC.
@@ -243,10 +137,14 @@ pub struct PerformanceConfig {
     #[serde(default = "default_candidate_batch_window_ms")]
     pub candidate_batch_window_ms: u64,
     /// Keep at most this many profitable candidates per route signature.
+    /// Note: ranking is disabled in the current pipeline; this field is reserved.
     #[serde(default = "default_candidate_top_per_route")]
+    #[allow(dead_code)]
     pub candidate_top_per_route: usize,
     /// Keep at most this many candidates globally per micro-batch.
+    /// Note: ranking is disabled in the current pipeline; this field is reserved.
     #[serde(default = "default_candidate_global_top_n")]
+    #[allow(dead_code)]
     pub candidate_global_top_n: usize,
     /// Hard cap for concurrent /swap-instructions requests.
     #[serde(default = "default_max_concurrent_swap_instructions")]
@@ -269,6 +167,11 @@ pub struct PerformanceConfig {
     /// Metis responses; lower to discard stale opportunities faster.
     #[serde(default = "default_queue_max_age_ms")]
     pub queue_max_age_ms: u64,
+    /// Number of concurrent simulation workers (Stage 2).
+    /// Each worker pops from simulation_queue, classifies venues, and forwards
+    /// to the Jito LIFO queue. Default 4.
+    #[serde(default = "default_sim_workers")]
+    pub sim_workers: usize,
     #[serde(default)]
     pub bot_cpu_cores: Vec<usize>,
 }
@@ -293,6 +196,10 @@ fn default_max_concurrent_swap_instructions() -> usize {
     32
 }
 
+fn default_sim_workers() -> usize {
+    4
+}
+
 fn default_swap_instructions_timeout_ms() -> u64 {
     800
 }
@@ -309,55 +216,106 @@ fn default_queue_max_age_ms() -> u64 {
     5000
 }
 
-/// Template cache configuration.
-///
-/// Rollout order:
-///   1. save_new=true       — extract and store route/hop templates from Metis
-///                            responses. No behaviour change yet.
-///   2. serve_route=true    — serve from RouteTemplate on hit, patching
-///                            in_amount / quoted_out_amount in the Borsh data.
-///                            Falls back to Metis when patching is not possible.
-///   3. serve_from_metis=false — RAM-only (miss = drop, no Metis call).
+/// Yellowstone / Geyser gRPC endpoint for real-time account update subscription.
+/// The same connection used by Metis; a separate subscription is opened for PMM pool accounts.
 #[derive(Debug, Deserialize, Clone)]
-pub struct TemplateCacheConfig {
-    /// Hard test switch: never serve or save templates; every instruction must
-    /// come from a fresh Metis /swap-instructions response.
+pub struct YellowstoneGrpcConfig {
+    /// Full gRPC endpoint URL, e.g. "https://solana-yellowstone-grpc.publicnode.com:443"
+    #[serde(default = "default_yellowstone_endpoint")]
+    pub endpoint: String,
+    /// Authentication token sent as the `x-token` gRPC metadata header.
     #[serde(default)]
-    pub force_fresh_metis_all: bool,
-    /// Extract and save route/hop templates from every Metis response.
-    #[serde(default)]
-    pub save_new: bool,
-    /// Serve from RouteTemplate when available (patches amounts if needed).
-    #[serde(default)]
-    pub serve_route: bool,
-    /// Call Metis for instructions when no route template hits.
-    #[serde(default = "default_true_tc")]
-    pub serve_from_metis: bool,
-    /// DEBUG/throughput switch. Normally DEXes with opaque pricing (SolFi,
-    /// AlphaQ, Tessera, GoonFi, ZeroFi, PancakeSwap, Byreal) are forced through
-    /// fresh Metis because their RAM templates cannot be safely amount-patched.
-    /// Set true to ignore that rule and allow RAM/template serving for them too.
-    /// This raises simulation throughput (more routes served from RAM) at the
-    /// cost of possibly-stale patched amounts; intended for error-collection
-    /// debug runs, not production trading.
-    #[serde(default)]
-    pub ignore_opaque_dex: bool,
+    pub x_token: String,
 }
 
-impl Default for TemplateCacheConfig {
+fn default_yellowstone_endpoint() -> String {
+    "https://solana-yellowstone-grpc.publicnode.com:443".to_string()
+}
+
+impl Default for YellowstoneGrpcConfig {
     fn default() -> Self {
-        Self {
-            force_fresh_metis_all: false,
-            save_new: false,
-            serve_route: false,
-            serve_from_metis: true,
-            ignore_opaque_dex: false,
-        }
+        Self { endpoint: default_yellowstone_endpoint(), x_token: String::new() }
     }
 }
 
-fn default_true_tc() -> bool {
-    true
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct ProgramEntry {
+    pub label: String,
+    pub program_id: String,
+    pub so_path: String,
+}
+
+/// Configuration for the pmm-sim subprocess integration.
+#[derive(Debug, Deserialize, Clone)]
+pub struct PmmSimConfig {
+    /// Whether to run pmm-sim LiteSVM simulation before sending to Jito.
+    #[serde(default = "default_pmm_sim_enabled")]
+    pub enabled: bool,
+    /// Path to the compiled `pmm-sim` binary.
+    #[serde(default = "default_pmm_sim_binary")]
+    pub binary: String,
+    /// Path to the pmm-sim `cfg/setup.toml`.
+    #[serde(default = "default_pmm_sim_setup")]
+    pub setup_path: String,
+    /// Path to the pmm-sim `cfg/programs/` directory containing .so files.
+    #[serde(default = "default_pmm_sim_programs")]
+    pub programs_path: String,
+    /// Path to the pmm-sim `cfg/accounts/` directory containing cached account JSON files.
+    #[serde(default = "default_pmm_sim_accounts")]
+    pub accounts_path: String,
+    /// Timeout in milliseconds for a single simulation request.
+    #[serde(default = "default_pmm_sim_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Path to Metis mix.json (pool definitions). Used to build the Yellowstone watchlist.
+    #[serde(default = "default_mix_json_path")]
+    pub mix_json_path: String,
+    /// Path to extra .so program files for full-tx simulation (e.g. /root/s/so/).
+    #[serde(default)]
+    pub extra_programs_path: String,
+    /// If true, candidates are dropped unless simulation succeeded.
+    #[serde(default)]
+    pub simulation_gate: bool,
+    /// Minimum simulated profit (lamports) to allow Jito send (only used when simulation_gate=true).
+    #[serde(default)]
+    pub min_profit_after_sim_lamports: i64,
+    /// Whether to bootstrap account cache from RPC at startup (batch getMultipleAccounts).
+    #[serde(default)]
+    pub rpc_bootstrap: bool,
+    /// Batch size for RPC account bootstrap (max 100).
+    #[serde(default = "default_rpc_bootstrap_batch_size")]
+    pub rpc_bootstrap_batch_size: usize,
+    /// Programs to load into pmm-sim LiteSVM for full-transaction simulation.
+    #[serde(default)]
+    pub programs: Vec<ProgramEntry>,
+}
+
+fn default_pmm_sim_enabled() -> bool { false }
+fn default_pmm_sim_binary() -> String { "./sim-server/target/release/sim-server".to_string() }
+fn default_pmm_sim_setup() -> String { "./pmm-sim/cfg/setup.toml".to_string() }
+fn default_pmm_sim_programs() -> String { "./pmm-sim/cfg/programs".to_string() }
+fn default_pmm_sim_accounts() -> String { "./pmm-sim/cfg/accounts".to_string() }
+fn default_pmm_sim_timeout_ms() -> u64 { 50 }
+fn default_mix_json_path() -> String { "/root/metis/1/mix.json".to_string() }
+fn default_rpc_bootstrap_batch_size() -> usize { 100 }
+
+impl Default for PmmSimConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_pmm_sim_enabled(),
+            binary: default_pmm_sim_binary(),
+            setup_path: default_pmm_sim_setup(),
+            programs_path: default_pmm_sim_programs(),
+            accounts_path: default_pmm_sim_accounts(),
+            timeout_ms: default_pmm_sim_timeout_ms(),
+            mix_json_path: default_mix_json_path(),
+            extra_programs_path: String::new(),
+            simulation_gate: false,
+            min_profit_after_sim_lamports: 0,
+            rpc_bootstrap: false,
+            rpc_bootstrap_batch_size: default_rpc_bootstrap_batch_size(),
+            programs: Vec::new(),
+        }
+    }
 }
 
 impl Config {

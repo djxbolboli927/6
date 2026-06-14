@@ -13,10 +13,19 @@ use solana_sdk::{
     system_instruction,
     transaction::VersionedTransaction,
 };
+use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 
-use crate::alt_cache::AltCache;
 use crate::metis::{InstructionData, SwapInstructionsResponse};
+
+/// Simple in-memory cache for Address Lookup Table accounts.
+/// Thread-safe; fetches from RPC on miss and caches the result.
+pub type AltLookup = Arc<Mutex<HashMap<Pubkey, Vec<Pubkey>>>>;
+
+pub fn new_alt_lookup() -> AltLookup {
+    Arc::new(Mutex::new(HashMap::new()))
+}
 
 /// Jito tip account addresses -- pick one at random for each bundle.
 /// Per Jito docs: do NOT use ALTs for tip accounts.
@@ -30,14 +39,6 @@ const JITO_TIP_ACCOUNTS: &[&str] = &[
     "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
     "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
 ];
-
-/// Return Jito tip account pubkeys (used by AltCache to filter them out).
-pub fn jito_tip_pubkeys() -> Vec<Pubkey> {
-    JITO_TIP_ACCOUNTS
-        .iter()
-        .filter_map(|a| Pubkey::from_str(a).ok())
-        .collect()
-}
 
 /// Convert a Metis instruction into a Solana SDK Instruction.
 fn to_sdk_instruction(ix: &InstructionData) -> Result<Instruction> {
@@ -66,45 +67,54 @@ fn to_sdk_instruction(ix: &InstructionData) -> Result<Instruction> {
     })
 }
 
-/// Build a versioned transaction that preserves the Jupiter/Metis instruction
-/// sequence and appends the Jito tip last:
+/// Fetch and cache an Address Lookup Table account.
+fn resolve_alt(
+    pubkey: &Pubkey,
+    cache: &AltLookup,
+    rpc: &RpcClient,
+) -> Result<AddressLookupTableAccount> {
+    {
+        let map = cache.lock().unwrap();
+        if let Some(addresses) = map.get(pubkey) {
+            return Ok(AddressLookupTableAccount {
+                key: *pubkey,
+                addresses: addresses.clone(),
+            });
+        }
+    }
+    let account = rpc
+        .get_account(pubkey)
+        .with_context(|| format!("fetch ALT account {pubkey}"))?;
+    #[allow(deprecated)]
+    let state =
+        solana_sdk::address_lookup_table::state::AddressLookupTable::deserialize(&account.data)
+            .with_context(|| format!("deserialize ALT {pubkey}"))?;
+    let addresses: Vec<Pubkey> = state.addresses.iter().copied().collect();
+    cache.lock().unwrap().insert(*pubkey, addresses.clone());
+    Ok(AddressLookupTableAccount {
+        key: *pubkey,
+        addresses,
+    })
+}
+
+/// Build a versioned transaction:
 ///
 /// #1 - Compute Budget: SetComputeUnitLimit
 /// #2 - optional Metis setup instructions
 /// #3 - Jupiter Aggregator: route_v2 (entire circular arb)
 /// #4 - optional Metis cleanup instruction
 /// #5 - System Program: Transfer (Jito tip, MUST be last)
-///
-/// Uses AltCache for ALT lookups (0ns on cache hit vs ~5ms RPC call).
-/// Uses pre-cached blockhash (passed in, ~100ns read vs ~5ms RPC call).
-///
-/// The on-chain minimum output (quotedOutAmount in the route_v2 instruction)
-/// is controlled by setting out_amount in the merged quote passed to Metis
-/// before calling this function — do not patch instruction bytes here.
 pub fn build_arb_transaction(
     swap_ixs: &SwapInstructionsResponse,
     payer: &Keypair,
     tip_lamports: u64,
     cu_limit: u32,
     recent_blockhash: Hash,
-    alt_cache: &AltCache,
+    alt_lookup: &AltLookup,
     rpc_client: &RpcClient,
 ) -> Result<VersionedTransaction> {
     let mut instructions: Vec<Instruction> = Vec::new();
 
-    // #1 -- SetComputeUnitLimit
-    //
-    // `cu_limit` from the config table budgets the *swap* (route_v2) only. The
-    // transaction also runs ATA CreateIdempotent setup instructions (and an
-    // optional cleanup) that each burn ~9k CU before the swap starts. Without
-    // explicit headroom these eat into the swap budget and the final hop dies
-    // with ComputationalBudgetExceeded — even though the route is profitable
-    // and would land on-chain with a larger limit.
-    //
-    // There is no SetComputeUnitPrice instruction in this tx, so a higher CU
-    // limit costs nothing (no priority fee; the Jito tip is fixed separately).
-    // We therefore add generous per-instruction headroom and cap at Solana's
-    // per-transaction maximum.
     const SETUP_IX_CU_BUDGET: u32 = 15_000;
     const MAX_TX_CU_LIMIT: u32 = 1_400_000;
     let aux_ix_count = swap_ixs.setup_instructions.len() as u32
@@ -123,37 +133,29 @@ pub fn build_arb_transaction(
     };
     instructions.push(cu_limit_ix);
 
-    // #2 -- Metis setup instructions, if any.
     for ix in &swap_ixs.setup_instructions {
         instructions.push(to_sdk_instruction(ix)?);
     }
 
-    // #3 -- Single route_v2 for the entire circular swap.
     instructions.push(to_sdk_instruction(&swap_ixs.swap_instruction)?);
 
-    // #4 -- Metis cleanup instruction, if any.
     if let Some(ix) = &swap_ixs.cleanup_instruction {
         instructions.push(to_sdk_instruction(ix)?);
     }
 
-    // Fetch ALTs via cache (instant on hit, RPC on first miss only)
-    let mut alt_addresses: Vec<Pubkey> = Vec::new();
+    let mut alt_pubkeys: Vec<Pubkey> = Vec::new();
     for addr in &swap_ixs.address_lookup_table_addresses {
-        let pubkey = Pubkey::from_str(addr)?;
-        if !alt_addresses.contains(&pubkey) {
-            alt_addresses.push(pubkey);
+        let pk = Pubkey::from_str(addr)?;
+        if !alt_pubkeys.contains(&pk) {
+            alt_pubkeys.push(pk);
         }
     }
 
     let mut address_lookup_tables: Vec<AddressLookupTableAccount> = Vec::new();
-    for alt_pubkey in &alt_addresses {
-        let alt_account = alt_cache.get_or_fetch(alt_pubkey, rpc_client)?;
-        address_lookup_tables.push(alt_account);
+    for pk in &alt_pubkeys {
+        address_lookup_tables.push(resolve_alt(pk, alt_lookup, rpc_client)?);
     }
 
-    // #5 -- Jito tip (MUST be last, MUST NOT be in ALT). Pick a tip account
-    // that is absent from this transaction's lookup tables instead of mutating
-    // ALT address lists, because changing ALT order changes on-chain indexes.
     let tip_candidates: Vec<Pubkey> = JITO_TIP_ACCOUNTS
         .iter()
         .filter_map(|addr| Pubkey::from_str(addr).ok())
@@ -176,7 +178,6 @@ pub fn build_arb_transaction(
         tip_lamports,
     ));
 
-    // Build VersionedTransaction v0
     let message = v0::Message::try_compile(
         &payer.pubkey(),
         &instructions,
@@ -193,45 +194,15 @@ pub fn build_arb_transaction(
 }
 
 /// Number of distinct accounts the transaction locks.
-///
-/// Solana enforces MAX_TX_ACCOUNT_LOCKS = 64: the total of static account
-/// keys PLUS every account pulled in through an Address Lookup Table counts
-/// toward this limit. ALTs shrink the *serialized size* of a tx but do NOT
-/// reduce the lock count, so a multi-hop circular swap with >64 distinct
-/// accounts is rejected by the block engine ("too many account locks") no
-/// matter how many ALTs it references. We compute this before sending so the
-/// guaranteed-reject transactions are dropped locally instead of burning a
-/// Jito rate-limit slot.
 pub fn account_lock_count(tx: &VersionedTransaction) -> usize {
     match &tx.message {
-        VersionedMessage::V0(msg) => {
-            let from_alt: usize = msg
-                .address_table_lookups
-                .iter()
-                .map(|l| l.writable_indexes.len() + l.readonly_indexes.len())
-                .sum();
-            msg.account_keys.len() + from_alt
+        VersionedMessage::Legacy(m) => m.account_keys.len(),
+        VersionedMessage::V0(m) => {
+            m.account_keys.len()
+                + m.address_table_lookups
+                    .iter()
+                    .map(|l| l.writable_indexes.len() + l.readonly_indexes.len())
+                    .sum::<usize>()
         }
-        VersionedMessage::Legacy(msg) => msg.account_keys.len(),
     }
-}
-
-/// Deserialize the addresses stored in an Address Lookup Table account.
-pub fn deserialize_alt_addresses(data: &[u8]) -> Result<Vec<Pubkey>> {
-    const HEADER_SIZE: usize = 56;
-    if data.len() < HEADER_SIZE {
-        anyhow::bail!("ALT account data too short: {} bytes", data.len());
-    }
-    let addresses_data = &data[HEADER_SIZE..];
-    if addresses_data.len() % 32 != 0 {
-        anyhow::bail!(
-            "ALT addresses data has invalid length: {} (not a multiple of 32)",
-            addresses_data.len()
-        );
-    }
-    let addresses: Vec<Pubkey> = addresses_data
-        .chunks_exact(32)
-        .map(|chunk| Pubkey::new_from_array(chunk.try_into().unwrap()))
-        .collect();
-    Ok(addresses)
 }

@@ -1,0 +1,20 @@
+[package]
+name = "sim-server"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "sim-server"
+path = "src/main.rs"
+
+[dependencies]
+litesvm           = "0.10.0"
+solana-sdk        = "3.0.0"
+solana-compute-budget = "3.0.0"
+spl-token         = "9.0.0"
+spl-associated-token-account = "8.0.0"
+serde             = { version = "1", features = ["derive"] }
+serde_json        = "1"
+base64            = "0.22"
+bs58              = "0.5"
+eyre              = "0.6"
