@@ -8,6 +8,7 @@ pub mod builder;
 pub mod cfg;
 pub mod env;
 pub mod misc;
+pub mod serve;
 
 use std::{
     collections::HashMap,
@@ -359,12 +360,28 @@ pub enum Cmd {
         )]
         pmms: Vec<PMMTarget>,
     },
+
+    #[command(
+        about = "Run as a JSON IPC simulation server: reads swap requests from stdin, executes in LiteSVM, writes results to stdout.",
+        after_help = "Examples:
+  pmm-sim serve
+  pmm-sim serve --programs-path=/path/to/cfg/programs --setup-path=/path/to/cfg/setup.toml"
+    )]
+    Serve {
+        #[arg(long, env = "SETUP_PATH", default_value = consts::SETUP_PATH, help = "Path to the setup configuration file")]
+        setup_path: String,
+
+        #[arg(long, env = "PROGRAMS_PATH", default_value = consts::PROGRAMS_PATH, help = "Directory to load .so program files from")]
+        programs_path: String,
+    },
 }
 
 impl Cmd {
     pub fn setup_path(&self) -> &str {
         match self {
-            Cmd::FetchAccounts { setup_path, .. } | Cmd::FetchPrograms { setup_path, .. } => setup_path,
+            Cmd::FetchAccounts { setup_path, .. }
+            | Cmd::FetchPrograms { setup_path, .. }
+            | Cmd::Serve { setup_path, .. } => setup_path,
             Cmd::Benchmark { common, .. }
             | Cmd::RouterSingle { common, .. }
             | Cmd::RouterMulti { common, .. }
@@ -380,6 +397,7 @@ impl Cmd {
             Cmd::RouterSingle { .. } => "SingleRouteSwaps",
             Cmd::RouterMulti { .. } => "MultiRouteSwaps",
             Cmd::Direct { .. } => "Direct",
+            Cmd::Serve { .. } => "Serve",
         }
     }
 }
@@ -532,6 +550,7 @@ impl App {
             Cmd::Benchmark { .. } => self.benchmark(),
             Cmd::RouterSingle { .. } | Cmd::RouterMulti { .. } => self.simulate(),
             Cmd::Direct { .. } => self.direct(),
+            Cmd::Serve { programs_path, .. } => crate::serve::run(programs_path),
         }
     }
 

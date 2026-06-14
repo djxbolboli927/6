@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = [".", "solfi-sim"]
+members = ["."]
 
 [package]
 name = "solana-arb-bot"
@@ -55,7 +55,7 @@ rand = "0.8"
 anyhow = "1"
 thiserror = "1"
 core_affinity = "0.8"
-solfi-sim = { path = "solfi-sim" }
+tokio-stream = "0.1"
 
 
 [build-dependencies]

@@ -496,21 +496,25 @@ pub fn spawn_workers(
 // ─── Stage 2: Simulation workers ─────────────────────────────────────────────
 
 /// Spawn simulation workers that pop from sim_queue, classify venues,
-/// run the simulation (with Phase 2 SolFi LiteSVM execution), log results,
-/// then forward to the Jito LIFO queue.
+/// optionally run LiteSVM simulation via the pmm-sim subprocess, then forward
+/// to the Jito LIFO queue.
 pub fn spawn_sim_workers(
     sim_queue: Arc<sim::SimQueue>,
     pipeline: Pipeline,
     metrics: Arc<Metrics>,
     worker_count: usize,
     queue_max_age_ms: u64,
-    solfi_cache: Arc<crate::solfi_sim::SolFiAccountCache>,
+    engine: Arc<crate::pmm_sim::PmmSimEngine>,
+    cache: crate::pmm_sim::AccountCache,
+    fee_payer: String,
 ) {
     for _ in 0..worker_count {
         let sim_q = sim_queue.clone();
         let pipe = pipeline.clone();
         let met = metrics.clone();
-        let cache = solfi_cache.clone();
+        let eng = engine.clone();
+        let acct_cache = cache.clone();
+        let fp = fee_payer.clone();
         tokio::spawn(async move {
             loop {
                 let req = sim_q.pop().await;
@@ -524,8 +528,8 @@ pub fn spawn_sim_workers(
                     continue;
                 }
 
-                // Phase 2: classify venues + run SolFi LiteSVM simulation.
-                let result = sim::simulate(&req, &cache);
+                // Classify venues and run pmm-sim LiteSVM simulation for PropAMM routes.
+                let result = sim::simulate(&req, &eng, &acct_cache, &fp).await;
 
                 met.sim_classified.fetch_add(1, Ordering::Relaxed);
 
@@ -546,7 +550,7 @@ pub fn spawn_sim_workers(
                     result.elapsed_us,
                 );
 
-                // Phase 2: forward ALL candidates to Jito regardless of sim result.
+                // Forward ALL candidates to Jito regardless of sim result.
                 // Phase 3 will gate on result.success here.
                 pipe.push(
                     ReadyInstruction {

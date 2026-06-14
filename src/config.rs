@@ -11,6 +11,10 @@ pub struct Config {
     pub performance: PerformanceConfig,
     #[serde(default)]
     pub jito_grpc: JitoGrpcConfig,
+    #[serde(default)]
+    pub yellowstone_grpc: YellowstoneGrpcConfig,
+    #[serde(default)]
+    pub pmm_sim: PmmSimConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -210,6 +214,71 @@ fn default_calc_workers() -> usize {
 
 fn default_queue_max_age_ms() -> u64 {
     5000
+}
+
+/// Yellowstone / Geyser gRPC endpoint for real-time account update subscription.
+/// The same connection used by Metis; a separate subscription is opened for PMM pool accounts.
+#[derive(Debug, Deserialize, Clone)]
+pub struct YellowstoneGrpcConfig {
+    /// Full gRPC endpoint URL, e.g. "https://solana-yellowstone-grpc.publicnode.com:443"
+    #[serde(default = "default_yellowstone_endpoint")]
+    pub endpoint: String,
+    /// Authentication token sent as the `x-token` gRPC metadata header.
+    #[serde(default)]
+    pub x_token: String,
+}
+
+fn default_yellowstone_endpoint() -> String {
+    "https://solana-yellowstone-grpc.publicnode.com:443".to_string()
+}
+
+impl Default for YellowstoneGrpcConfig {
+    fn default() -> Self {
+        Self { endpoint: default_yellowstone_endpoint(), x_token: String::new() }
+    }
+}
+
+/// Configuration for the pmm-sim subprocess integration.
+#[derive(Debug, Deserialize, Clone)]
+pub struct PmmSimConfig {
+    /// Whether to run pmm-sim LiteSVM simulation before sending to Jito.
+    #[serde(default = "default_pmm_sim_enabled")]
+    pub enabled: bool,
+    /// Path to the compiled `pmm-sim` binary.
+    #[serde(default = "default_pmm_sim_binary")]
+    pub binary: String,
+    /// Path to the pmm-sim `cfg/setup.toml`.
+    #[serde(default = "default_pmm_sim_setup")]
+    pub setup_path: String,
+    /// Path to the pmm-sim `cfg/programs/` directory containing .so files.
+    #[serde(default = "default_pmm_sim_programs")]
+    pub programs_path: String,
+    /// Path to the pmm-sim `cfg/accounts/` directory containing cached account JSON files.
+    #[serde(default = "default_pmm_sim_accounts")]
+    pub accounts_path: String,
+    /// Timeout in milliseconds for a single simulation request.
+    #[serde(default = "default_pmm_sim_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_pmm_sim_enabled() -> bool { false }
+fn default_pmm_sim_binary() -> String { "./pmm-sim/target/release/pmm-sim".to_string() }
+fn default_pmm_sim_setup() -> String { "./pmm-sim/cfg/setup.toml".to_string() }
+fn default_pmm_sim_programs() -> String { "./pmm-sim/cfg/programs".to_string() }
+fn default_pmm_sim_accounts() -> String { "./pmm-sim/cfg/accounts".to_string() }
+fn default_pmm_sim_timeout_ms() -> u64 { 50 }
+
+impl Default for PmmSimConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_pmm_sim_enabled(),
+            binary: default_pmm_sim_binary(),
+            setup_path: default_pmm_sim_setup(),
+            programs_path: default_pmm_sim_programs(),
+            accounts_path: default_pmm_sim_accounts(),
+            timeout_ms: default_pmm_sim_timeout_ms(),
+        }
+    }
 }
 
 impl Config {

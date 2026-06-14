@@ -6,9 +6,9 @@ mod jito;
 mod jito_grpc;
 mod metis;
 mod metrics;
+mod pmm_sim;
 mod rate_limiter;
 mod sim;
-mod solfi_sim;
 mod token_metrics;
 mod tokens;
 mod transaction;
@@ -127,7 +127,18 @@ async fn async_main(config: config::Config) -> Result<()> {
         (None, None)
     };
 
-    let solfi_cache = solfi_sim::SolFiAccountCache::new(config.rpc.url.clone());
+    // ── PMM simulation: account cache (Yellowstone) + pmm-sim subprocess ───────
+    let pmm_cache = pmm_sim::new_account_cache();
+    pmm_sim::preload_cache_from_disk(&config.pmm_sim.accounts_path, &pmm_cache);
+    pmm_sim::spawn_yellowstone_subscription(
+        config.yellowstone_grpc.endpoint.clone(),
+        config.yellowstone_grpc.x_token.clone(),
+        pmm_cache.clone(),
+    );
+    let pmm_engine = pmm_sim::PmmSimEngine::new(config.pmm_sim.clone());
+    if config.pmm_sim.enabled {
+        pmm_engine.ensure_started().await;
+    }
 
     let blockhash_cache = Arc::new(BlockhashCache::new(rpc_client.clone()));
 
@@ -169,13 +180,16 @@ async fn async_main(config: config::Config) -> Result<()> {
     );
 
     // Stage 2: simulation workers (pop from sim_queue → classify → push to pipeline)
+    let fee_payer_str = trading_keypair.pubkey().to_string();
     arbitrage::spawn_sim_workers(
         sim_queue,
         pipeline.clone(),
         metrics.clone(),
         sim_worker_count,
         config.performance.queue_max_age_ms,
-        solfi_cache,
+        pmm_engine,
+        pmm_cache,
+        fee_payer_str,
     );
 
     eprintln!(

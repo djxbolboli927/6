@@ -166,7 +166,7 @@ impl SimQueue {
 //   swap adapters (constant-product, concentrated-liquidity, DLMM, etc.).
 
 pub fn simulate_stub(req: &SimulationRequest) -> SimulationResult {
-    let t = Instant::now();
+    let t = std::time::Instant::now();
     let venues = classify_route(&req.merged_quote.route_plan);
 
     let unsupported: Vec<String> = venues
@@ -212,39 +212,90 @@ pub fn simulate_stub(req: &SimulationRequest) -> SimulationResult {
     }
 }
 
-// ─── Phase 2: SolFi LiteSVM simulation ───────────────────────────────────────
+// ─── Phase 2: pmm-sim LiteSVM simulation ─────────────────────────────────────
 //
-// Extends simulate_stub with real SolFi swap simulation via LiteSVM.
-// SolFi hops are detected in the route_plan, simulated with fresh accounts
-// from the SolFiAccountCache, and the results are logged.
-// Phase 2 still forwards ALL candidates to Jito — Phase 3 will gate on results.
+// For routes that contain only PropAMM hops, the actual swap instruction from
+// Metis is forwarded to the pmm-sim subprocess which executes it in LiteSVM
+// with the latest Yellowstone-sourced pool state.  All other routes fall back
+// to simulate_stub (classification only).
 
-pub fn simulate(
+static SIM_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Extract all unique token mints from the route_plan (inputMint + outputMint of each hop).
+pub fn extract_route_mints(route_plan: &serde_json::Value) -> Vec<String> {
+    let mut mints = std::collections::HashSet::new();
+    if let Some(arr) = route_plan.as_array() {
+        for hop in arr {
+            if let Some(info) = hop.get("swapInfo") {
+                if let Some(m) = info.get("inputMint").and_then(|v| v.as_str()) {
+                    mints.insert(m.to_string());
+                }
+                if let Some(m) = info.get("outputMint").and_then(|v| v.as_str()) {
+                    mints.insert(m.to_string());
+                }
+            }
+        }
+    }
+    mints.into_iter().collect()
+}
+
+pub async fn simulate(
     req: &SimulationRequest,
-    solfi_cache: &Arc<crate::solfi_sim::SolFiAccountCache>,
+    engine: &Arc<crate::pmm_sim::PmmSimEngine>,
+    cache: &crate::pmm_sim::AccountCache,
+    fee_payer: &str,
 ) -> SimulationResult {
     let mut result = simulate_stub(req);
 
-    // Attempt SolFi simulation if a fresh snapshot is available.
-    if let Some(snapshot) = solfi_cache.get_snapshot() {
-        let hop_results =
-            crate::solfi_sim::simulate_solfi_hops(&snapshot, &req.merged_quote.route_plan);
-        if !hop_results.is_empty() {
-            for hop in &hop_results {
-                if hop.success {
-                    result.logs.push(format!(
-                        "[solfi_sim_ok] market={} amount_in={} amount_out={}",
-                        hop.market, hop.amount_in, hop.amount_out
-                    ));
-                } else {
-                    result.logs.push(format!(
-                        "[solfi_sim_err] market={} amount_in={} error={}",
-                        hop.market,
-                        hop.amount_in,
-                        hop.error.as_deref().unwrap_or("unknown")
-                    ));
-                }
-            }
+    // Only attempt pmm-sim for pure PropAMM routes.
+    if result.sim_kind != "prop_amm_pmm_sim" {
+        return result;
+    }
+
+    let t = std::time::Instant::now();
+    let id = SIM_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let token_mints = extract_route_mints(&req.merged_quote.route_plan);
+    let src_mint = req.merged_quote.input_mint.clone();
+    let src_amount: u64 = req.merged_quote.in_amount.parse().unwrap_or(0);
+
+    let ipc_req = crate::pmm_sim::build_sim_request(
+        id,
+        fee_payer,
+        &req.instructions.swap_instruction,
+        token_mints,
+        &src_mint,
+        src_amount,
+        cache,
+    );
+
+    match engine.simulate(&ipc_req).await {
+        Some(resp) if resp.success => {
+            result.logs.push(format!(
+                "[pmm_sim_ok] id={} amount_out={} cu={} elapsed_us={}",
+                resp.id,
+                resp.amount_out.unwrap_or(0),
+                resp.compute_units.unwrap_or(0),
+                t.elapsed().as_micros(),
+            ));
+            result.final_out_amount = resp.amount_out;
+            result.consumed_compute_units = resp.compute_units;
+            result.success = true;
+        }
+        Some(resp) => {
+            result.logs.push(format!(
+                "[pmm_sim_fail] id={} error={} elapsed_us={}",
+                resp.id,
+                resp.error.as_deref().unwrap_or("unknown"),
+                t.elapsed().as_micros(),
+            ));
+            result.success = false;
+        }
+        None => {
+            result.logs.push(format!(
+                "[pmm_sim_unavailable] elapsed_us={}",
+                t.elapsed().as_micros()
+            ));
         }
     }
 
