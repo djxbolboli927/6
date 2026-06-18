@@ -31,7 +31,7 @@ urls = [
     "https://tokyo.mainnet.block-engine.jito.wtf",
 ]
 uuid = "8c7cda54-ef6e-4792-8617-da0341f8d485"
-trading_keypair = "/root/c/wallet/wallet.json"
+trading_keypair = "/root/s/wallet/wallet.json"
 tip_min_lamports = 1000
 tip_max_lamports = 1000000
 tip_profit_percent = 0.50
@@ -155,7 +155,7 @@ endpoints = [
 ]
 # این ولت توسط جیتو whitelist شده — هیچ دارایی‌ای نگه نمی‌دارد و هیچ
 # تراکنشی امضا نمی‌کند. فقط برای احراز هویت اتصال gRPC استفاده می‌شود.
-auth_keypair = "/root/c/wallet/grpc.json"
+auth_keypair = "/root/s/wallet/grpc.json"
 max_bundles_per_second = 5
 
 # pmm-sim subprocess. برای تست BisonFi باید به باینری pmm-sim اشاره کند
@@ -169,7 +169,7 @@ accounts_path = "./pmm-sim/cfg/accounts"
 # build_bison داخل LiteSVM سریع است؛ مهلت کمی بالاتر برای حاشیه‌ی امن.
 timeout_ms = 200
 # در حالت تست، watchlist از خود [bison_test] ساخته می‌شود؛ این مسیر اختیاری است.
-mix_json_path = "/root/metis/1/mix.json"
+mix_json_path = "/root/s/metis/1/mix.json"
 # true = موقع استارت state استخر را مستقیم از RPC می‌گیرد تا cache گرم باشد و
 # جریان بدون انتظار برای اولین آپدیت Yellowstone شروع شود.
 rpc_bootstrap = true
