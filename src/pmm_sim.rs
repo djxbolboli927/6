@@ -248,6 +248,11 @@ impl PmmSimEngine {
         }
     }
 
+    /// Whether the subprocess handle is currently live (spawned and not torn down).
+    pub async fn is_running(&self) -> bool {
+        self.handle.lock().await.is_some()
+    }
+
     /// Build + simulate a single BisonFi `WSOL -> USDC` leg.
     pub async fn build_bison(
         &self,
@@ -329,6 +334,7 @@ use tonic::{
 pub struct UpdateTrigger {
     pub keys: Arc<std::collections::HashSet<String>>,
     pub notify: Arc<tokio::sync::Notify>,
+    pub metrics: Arc<crate::bison_metrics::BisonMetrics>,
 }
 
 /// Spawn a background task that subscribes to Yellowstone gRPC and keeps the
@@ -420,6 +426,7 @@ async fn run_subscription(
                         // Fire the live-update trigger if this account is watched.
                         if let Some(t) = trigger {
                             if t.keys.contains(&pubkey) {
+                                t.metrics.record_pool_update();
                                 t.notify.notify_one();
                             }
                         }

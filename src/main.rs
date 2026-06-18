@@ -1,4 +1,5 @@
 mod arbitrage;
+mod bison_metrics;
 mod bison_test;
 mod blockhash_cache;
 mod config;
@@ -137,8 +138,9 @@ async fn async_main(config: config::Config) -> Result<()> {
     // When enabled, the scanner is fully disabled and a single fixed flow runs,
     // re-triggered live on every pool update. Build the trigger BEFORE the
     // Yellowstone subscription so no early update is lost.
+    let bison_metrics = bison_metrics::BisonMetrics::new();
     let (bison_trigger, bison_notify) = if config.bison_test.enabled {
-        let (t, n) = bison_test::make_trigger(&config.bison_test);
+        let (t, n) = bison_test::make_trigger(&config.bison_test, bison_metrics.clone());
         (Some(t), Some(n))
     } else {
         (None, None)
@@ -214,6 +216,7 @@ async fn async_main(config: config::Config) -> Result<()> {
             pmm_cache.clone(),
             config.trading.min_profit_lamports,
             notify,
+            bison_metrics.clone(),
         )
         .await;
         return Ok(());

@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use solana_sdk::signer::Signer;
 
 use crate::arbitrage::CalcCtx;
+use crate::bison_metrics::BisonMetrics;
 use crate::config::BisonTestConfig;
 use crate::metis::{InstructionData, SwapInstructionsResponse};
 use crate::pmm_sim::{
@@ -83,7 +84,10 @@ static REQ_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 /// Build the live-update trigger so `main` can attach it to the Yellowstone
 /// subscription BEFORE the subscription starts (otherwise early updates would be
 /// missed). Returns the trigger and the shared notify to hand to `run_with_notify`.
-pub fn make_trigger(cfg: &BisonTestConfig) -> (pmm_sim::UpdateTrigger, Arc<tokio::sync::Notify>) {
+pub fn make_trigger(
+    cfg: &BisonTestConfig,
+    metrics: Arc<BisonMetrics>,
+) -> (pmm_sim::UpdateTrigger, Arc<tokio::sync::Notify>) {
     let watched: std::collections::HashSet<String> =
         [cfg.market.clone(), cfg.base_ta.clone(), cfg.quote_ta.clone()]
             .into_iter()
@@ -93,6 +97,7 @@ pub fn make_trigger(cfg: &BisonTestConfig) -> (pmm_sim::UpdateTrigger, Arc<tokio
         pmm_sim::UpdateTrigger {
             keys: Arc::new(watched),
             notify: notify.clone(),
+            metrics,
         },
         notify,
     )
@@ -107,6 +112,7 @@ pub async fn run_with_notify(
     cache: AccountCache,
     min_profit_lamports: u64,
     notify: Arc<tokio::sync::Notify>,
+    metrics: Arc<BisonMetrics>,
 ) {
     if cfg.market.is_empty() || cfg.base_ta.is_empty() || cfg.quote_ta.is_empty() {
         eprintln!("[bison_test] FATAL: market/base_ta/quote_ta must be set in [bison_test]");
@@ -122,8 +128,11 @@ pub async fn run_with_notify(
         min_profit_lamports,
         cfg.amount_in_lamports + min_profit_lamports,
     );
+
+    spawn_metrics_reporter(metrics.clone(), cache.clone(), engine.clone(), &cfg);
+
     loop {
-        run_once(&cfg, &ctx, &engine, &cache, min_profit_lamports).await;
+        run_once(&cfg, &ctx, &engine, &cache, min_profit_lamports, &metrics).await;
         // Re-evaluate the instant the pool changes (live, low-latency). The
         // fallback sleep is only a safety net so the test keeps running even if
         // the Yellowstone stream is quiet — it never adds latency to a real
@@ -135,6 +144,51 @@ pub async fn run_with_notify(
     }
 }
 
+/// Spawn the 30-second diagnostic report for the BisonFi test flow.
+fn spawn_metrics_reporter(
+    metrics: Arc<BisonMetrics>,
+    cache: AccountCache,
+    engine: Arc<PmmSimEngine>,
+    cfg: &BisonTestConfig,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let keys = vec![cfg.market.clone(), cfg.base_ta.clone(), cfg.quote_ta.clone()];
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+
+            let updates = metrics.grpc_pool_updates.swap(0, Relaxed);
+            let iv_sum = metrics.grpc_interval_sum_ms.swap(0, Relaxed);
+            let iv_n = metrics.grpc_interval_samples.swap(0, Relaxed);
+            let reqs = metrics.build_requests.swap(0, Relaxed);
+            let resps = metrics.build_responses.swap(0, Relaxed);
+            let succ = metrics.build_success.swap(0, Relaxed);
+            let rt_sum = metrics.build_resp_us_sum.swap(0, Relaxed);
+            let rt_n = metrics.build_resp_samples.swap(0, Relaxed);
+            let avg_iv = if iv_n > 0 { iv_sum / iv_n } else { 0 };
+            let avg_rt = if rt_n > 0 { rt_sum / rt_n } else { 0 };
+
+            // Live cache warmth for the pool accounts.
+            let (found, missing) = pmm_sim::collect_accounts_by_pubkey(&keys, &cache);
+            let pmm_up = engine.is_running().await;
+            metrics.set_pmm_up(pmm_up);
+
+            eprintln!(
+                "[bison30s] pmm_up={pmm_up} \
+pool_grpc_updates={updates} avg_update_interval_ms={avg_iv} \
+pool_accounts_in_cache={}/{} missing=[{}] \
+bot->pmm_requests={reqs} pmm->bot_responses={resps} build_success={succ} \
+avg_pmm_resp_us={avg_rt}",
+                found.len(),
+                keys.len(),
+                missing.join(","),
+            );
+        }
+    });
+}
+
 /// Safety-net re-evaluation interval when no live pool update arrives.
 const FALLBACK_TICK_MS: u64 = 2000;
 
@@ -144,6 +198,7 @@ async fn run_once(
     engine: &Arc<PmmSimEngine>,
     cache: &AccountCache,
     min_profit_lamports: u64,
+    metrics: &Arc<BisonMetrics>,
 ) {
     let started = Instant::now();
     let amount_in = cfg.amount_in_lamports;
@@ -177,13 +232,19 @@ async fn run_once(
         accounts,
     };
 
+    metrics.record_build_request();
+    let build_started = Instant::now();
     let build = match engine.build_bison(&build_req).await {
         Some(b) => b,
         None => {
+            metrics.set_pmm_up(false);
             eprintln!("[bison_test] skip: pmm-sim unavailable / timed out");
             return;
         }
     };
+    let build_us = build_started.elapsed().as_micros() as u64;
+    let build_ok = build.success && build.amount_out.map(|v| v > 0).unwrap_or(false);
+    metrics.record_build_response(build_us, build_ok);
     if !build.success {
         eprintln!(
             "[bison_test] skip: BisonFi sim failed error={}",
