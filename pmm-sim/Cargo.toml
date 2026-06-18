@@ -24,6 +24,14 @@ register-tracing = ["litesvm/register-tracing"]
 [dependencies]
 base64 = "0.22.1"
 bs58 = "0.5"
+# Pin the brotli stack: brotli 8.0.3 fails to compile on rustc 1.94 because the
+# graph ends up with two divergent `alloc-no-stdlib` majors (2.0.4 vs 3.0.0),
+# so `StandardAlloc` no longer satisfies brotli's `Allocator<T>`. 8.0.4 +
+# brotli-decompressor 5.0.3 realign on a single alloc-no-stdlib and build cleanly.
+# brotli is only a *transitive* dep (via reqwest/tower-http and polars-parquet);
+# it is declared here solely to floor the version regardless of a stale lockfile.
+brotli = "8.0.4"
+brotli-decompressor = "5.0.3"
 chrono = "0.4.42"
 clap = { version = "4.5.53", features = ["derive", "env", "color", "std"] }
 eyre = "0.6.12"
