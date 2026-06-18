@@ -105,6 +105,59 @@ pub struct PmmSimResponse {
     pub error: Option<String>,
 }
 
+// ── BisonFi build+quote IPC (first-test mode) ─────────────────────────────────
+//
+// Distinct from the full-tx simulation path: this asks pmm-sim to BUILD a DFlow
+// `swap2` (spoof-Magnus) instruction for a single BisonFi leg and simulate it,
+// returning BOTH the predicted output AND the ready-to-send instruction.
+
+/// Request to build + simulate a single BisonFi `WSOL -> USDC` leg.
+#[derive(Serialize)]
+pub struct BuildBisonRequest {
+    /// Discriminates this op from the full-sim path. Always "build_bison".
+    pub op: &'static str,
+    pub id: u64,
+    /// Real trading wallet — the returned instruction references its real ATAs.
+    pub fee_payer: String,
+    /// BisonFi market (pool) account.
+    pub market: String,
+    pub src_mint: String,
+    pub dst_mint: String,
+    pub amount_in: u64,
+    /// Fresh pool account state (market + both vaults) from the Yellowstone cache.
+    pub accounts: Vec<IpcAccount>,
+}
+
+/// One account meta of a built instruction (mirrors Metis `AccountMeta`).
+#[derive(Deserialize, Debug, Clone)]
+pub struct IpcInstructionAccount {
+    pub pubkey: String,
+    pub is_signer: bool,
+    pub is_writable: bool,
+}
+
+/// A fully-built instruction returned by pmm-sim (base64 data, real accounts).
+#[derive(Deserialize, Debug, Clone)]
+pub struct IpcInstructionOut {
+    pub program_id: String,
+    pub accounts: Vec<IpcInstructionAccount>,
+    pub data: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct BuildBisonResponse {
+    #[allow(dead_code)]
+    pub id: u64,
+    pub success: bool,
+    /// Predicted USDC out (raw units) for the simulated BisonFi leg.
+    pub amount_out: Option<u64>,
+    #[allow(dead_code)]
+    pub compute_units: Option<u64>,
+    /// The DFlow swap2 (spoof-Magnus) instruction to splice into the bundle.
+    pub instruction: Option<IpcInstructionOut>,
+    pub error: Option<String>,
+}
+
 // ── Subprocess handle ─────────────────────────────────────────────────────────
 
 struct SubprocessHandle {
@@ -174,6 +227,36 @@ impl PmmSimEngine {
         &self,
         request: &FullSimRequest,
     ) -> Option<PmmSimResponse> {
+        let line = self.roundtrip(request).await?;
+        match serde_json::from_str::<PmmSimResponse>(line.trim()) {
+            Ok(resp) => Some(resp),
+            Err(e) => {
+                warn!("[pmm_sim] failed to parse response: {e} line={line:?}");
+                *self.handle.lock().await = None;
+                None
+            }
+        }
+    }
+
+    /// Build + simulate a single BisonFi `WSOL -> USDC` leg.
+    pub async fn build_bison(
+        &self,
+        request: &BuildBisonRequest,
+    ) -> Option<BuildBisonResponse> {
+        let line = self.roundtrip(request).await?;
+        match serde_json::from_str::<BuildBisonResponse>(line.trim()) {
+            Ok(resp) => Some(resp),
+            Err(e) => {
+                warn!("[pmm_sim] failed to parse build_bison response: {e} line={line:?}");
+                *self.handle.lock().await = None;
+                None
+            }
+        }
+    }
+
+    /// Serialize `request` to one JSON line, write it to the subprocess, and
+    /// return the raw response line. Closes the handle on any IO/timeout error.
+    async fn roundtrip<T: serde::Serialize>(&self, request: &T) -> Option<String> {
         let mut guard = self.handle.lock().await;
         let handle = guard.as_mut()?;
 
@@ -193,17 +276,7 @@ impl PmmSimEngine {
         .await;
 
         match result {
-            Ok(Ok(resp_line)) if !resp_line.trim().is_empty() => {
-                match serde_json::from_str::<PmmSimResponse>(resp_line.trim()) {
-                    Ok(resp) => Some(resp),
-                    Err(e) => {
-                        warn!("[pmm_sim] failed to parse response: {e} line={resp_line:?}");
-                        // Subprocess may be in a bad state; close the handle.
-                        *guard = None;
-                        None
-                    }
-                }
-            }
+            Ok(Ok(resp_line)) if !resp_line.trim().is_empty() => Some(resp_line),
             Ok(Ok(_)) => {
                 warn!("[pmm_sim] empty response from subprocess");
                 *guard = None;
@@ -215,7 +288,7 @@ impl PmmSimEngine {
                 None
             }
             Err(_) => {
-                warn!("[pmm_sim] simulation timed out after {}ms", self.timeout.as_millis());
+                warn!("[pmm_sim] request timed out after {}ms", self.timeout.as_millis());
                 *guard = None;
                 None
             }
@@ -239,6 +312,15 @@ use tonic::{
     Request,
 };
 
+/// Optional live-update trigger: when a watched account whose pubkey is in
+/// `keys` updates, `notify` is signalled. Used by the BisonFi test flow to react
+/// the instant the pool state changes (rather than polling on a timer).
+#[derive(Clone)]
+pub struct UpdateTrigger {
+    pub keys: Arc<std::collections::HashSet<String>>,
+    pub notify: Arc<tokio::sync::Notify>,
+}
+
 /// Spawn a background task that subscribes to Yellowstone gRPC and keeps the
 /// account cache up to date. On disconnect the task reconnects automatically.
 pub fn spawn_yellowstone_subscription(
@@ -246,10 +328,14 @@ pub fn spawn_yellowstone_subscription(
     x_token: String,
     watchlist: Vec<String>,
     cache: AccountCache,
+    trigger: Option<UpdateTrigger>,
 ) {
     tokio::spawn(async move {
         loop {
-            if let Err(e) = run_subscription(&endpoint, &x_token, &watchlist, cache.clone()).await {
+            if let Err(e) =
+                run_subscription(&endpoint, &x_token, &watchlist, cache.clone(), trigger.as_ref())
+                    .await
+            {
                 warn!("[yellowstone] subscription error: {e} — reconnecting in 2s");
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -262,6 +348,7 @@ async fn run_subscription(
     x_token: &str,
     watchlist: &[String],
     cache: AccountCache,
+    trigger: Option<&UpdateTrigger>,
 ) -> anyhow::Result<()> {
     let channel = Channel::from_shared(endpoint.to_string())?
         .tls_config(tonic::transport::ClientTlsConfig::new().with_enabled_roots())?
@@ -318,7 +405,13 @@ async fn run_subscription(
                             rent_epoch: info.rent_epoch,
                         };
                         if let Ok(mut w) = cache.write() {
-                            w.insert(pubkey, cached);
+                            w.insert(pubkey.clone(), cached);
+                        }
+                        // Fire the live-update trigger if this account is watched.
+                        if let Some(t) = trigger {
+                            if t.keys.contains(&pubkey) {
+                                t.notify.notify_one();
+                            }
                         }
                     }
                 }
@@ -360,6 +453,35 @@ pub fn collect_all_instruction_accounts(
         }
     }
     result
+}
+
+/// Collect `IpcAccount`s for an explicit list of pubkeys from the cache.
+/// Returns only the ones currently present; missing pubkeys are reported via
+/// the second element so the caller can decide whether state is warm enough.
+pub fn collect_accounts_by_pubkey(
+    pubkeys: &[String],
+    cache: &AccountCache,
+) -> (Vec<IpcAccount>, Vec<String>) {
+    let mut found = Vec::new();
+    let mut missing = Vec::new();
+    let r = match cache.read() {
+        Ok(r) => r,
+        Err(_) => return (found, pubkeys.to_vec()),
+    };
+    for pk in pubkeys {
+        match r.get(pk) {
+            Some(acc) => found.push(IpcAccount {
+                pubkey: pk.clone(),
+                lamports: acc.lamports,
+                data: B64.encode(&acc.data),
+                owner: bs58::encode(acc.owner).into_string(),
+                executable: acc.executable,
+                rent_epoch: acc.rent_epoch,
+            }),
+            None => missing.push(pk.clone()),
+        }
+    }
+    (found, missing)
 }
 
 /// Bootstrap account cache from RPC using batched getMultipleAccounts.

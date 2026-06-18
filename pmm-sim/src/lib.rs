@@ -550,7 +550,7 @@ impl App {
             Cmd::Benchmark { .. } => self.benchmark(),
             Cmd::RouterSingle { .. } | Cmd::RouterMulti { .. } => self.simulate(),
             Cmd::Direct { .. } => self.direct(),
-            Cmd::Serve { programs_path, .. } => crate::serve::run(programs_path),
+            Cmd::Serve { programs_path, .. } => crate::serve::run(&self.cfg, programs_path),
         }
     }
 

@@ -1,3 +1,8 @@
+# Standalone workspace: pmm-sim builds independently of the root bot workspace
+# (it uses SDK 3.0 / litesvm 0.10 + the private magnus crates, which must not be
+# resolved together with the root crate's SDK 2.2 graph).
+[workspace]
+
 [package]
 name = "pmm-sim"
 version = "0.2.0"

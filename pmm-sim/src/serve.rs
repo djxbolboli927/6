@@ -56,8 +56,13 @@ use solana_sdk::{
 use spl_associated_token_account::get_associated_token_address;
 
 use crate::Aggregator;
+use crate::builder::ConstructSwap;
+use crate::cfg::Cfg;
 use crate::misc::Misc;
 use crate::consts;
+
+use magnus_router_client::types::SwapArgs;
+use magnus_shared::{Dex, Route};
 
 // ── IPC types ─────────────────────────────────────────────────────────────────
 
@@ -125,6 +130,54 @@ struct ServeResponse {
     error: Option<String>,
 }
 
+// ── BisonFi build+quote op ──────────────────────────────────────────────────
+//
+// Distinct from the full-tx sim path: the bot asks us to BUILD a DFlow `swap2`
+// (spoof-Magnus) instruction for a single BisonFi leg, simulate it, and return
+// BOTH the predicted output AND the instruction (referencing the real wallet).
+
+/// Lightweight probe to route a request line to the right handler.
+#[derive(Deserialize)]
+struct OpProbe {
+    #[serde(default)]
+    op: String,
+}
+
+#[derive(Deserialize)]
+struct BuildBisonRequest {
+    id: u64,
+    fee_payer: String,
+    market: String,
+    src_mint: String,
+    dst_mint: String,
+    amount_in: u64,
+    accounts: Vec<ServeAccount>,
+}
+
+#[derive(Serialize)]
+struct OutAccountMeta {
+    pubkey: String,
+    is_signer: bool,
+    is_writable: bool,
+}
+
+#[derive(Serialize)]
+struct OutInstruction {
+    program_id: String,
+    accounts: Vec<OutAccountMeta>,
+    data: String, // base64
+}
+
+#[derive(Serialize)]
+struct BuildBisonResponse {
+    id: u64,
+    success: bool,
+    amount_out: Option<u64>,
+    compute_units: Option<u64>,
+    instruction: Option<OutInstruction>,
+    error: Option<String>,
+}
+
 // ── Router program IDs ────────────────────────────────────────────────────────
 
 fn router_program_id() -> Pubkey {
@@ -149,7 +202,7 @@ fn aggregator_for_program(program_id: &Pubkey) -> Option<Aggregator> {
 
 /// Run the serve loop: initialise LiteSVM with all programs, then process
 /// JSON requests from stdin until EOF.
-pub fn run(programs_path: &str) -> eyre::Result<()> {
+pub fn run(cfg: &Cfg, programs_path: &str) -> eyre::Result<()> {
     let mut svm = build_base_svm(programs_path)?;
 
     // One persistent simulation wallet — we patch the fee_payer in every request
@@ -175,22 +228,181 @@ pub fn run(programs_path: &str) -> eyre::Result<()> {
             }
         };
 
-        let response = match process_request(&mut svm, &sim_wallet, &line) {
-            Ok(resp) => resp,
-            Err(e) => {
-                // Try to extract the id for the error response.
-                let id = extract_id(&line).unwrap_or(0);
-                ServeResponse { id, success: false, amount_out: None, compute_units: None, error: Some(e.to_string()) }
-            }
+        // Route by `op`: "build_bison" → BisonFi build+quote; otherwise full-tx sim.
+        let op = serde_json::from_str::<OpProbe>(&line).map(|p| p.op).unwrap_or_default();
+        let out = if op == "build_bison" {
+            let resp = match process_build_bison(&mut svm, cfg, &sim_wallet, &line) {
+                Ok(resp) => resp,
+                Err(e) => BuildBisonResponse {
+                    id: extract_id(&line).unwrap_or(0),
+                    success: false,
+                    amount_out: None,
+                    compute_units: None,
+                    instruction: None,
+                    error: Some(e.to_string()),
+                },
+            };
+            serde_json::to_string(&resp)
+        } else {
+            let resp = match process_request(&mut svm, &sim_wallet, &line) {
+                Ok(resp) => resp,
+                Err(e) => ServeResponse {
+                    id: extract_id(&line).unwrap_or(0),
+                    success: false,
+                    amount_out: None,
+                    compute_units: None,
+                    error: Some(e.to_string()),
+                },
+            };
+            serde_json::to_string(&resp)
         };
 
-        let mut out = serde_json::to_string(&response).unwrap_or_else(|_| r#"{"id":0,"success":false,"error":"serialization error"}"#.to_string());
+        let mut out = out.unwrap_or_else(|_| r#"{"id":0,"success":false,"error":"serialization error"}"#.to_string());
         out.push('\n');
         let _ = stdout_lock.write_all(out.as_bytes());
         let _ = stdout_lock.flush();
     }
 
     Ok(())
+}
+
+// ── BisonFi build+quote handler ─────────────────────────────────────────────
+
+fn process_build_bison(
+    svm: &mut LiteSVM,
+    cfg: &Cfg,
+    sim_wallet: &Keypair,
+    line: &str,
+) -> eyre::Result<BuildBisonResponse> {
+    let req: BuildBisonRequest = serde_json::from_str(line)?;
+
+    let fee_payer = Pubkey::from_str(&req.fee_payer).map_err(|e| eyre::eyre!("fee_payer: {e}"))?;
+    let market = Pubkey::from_str(&req.market).map_err(|e| eyre::eyre!("market: {e}"))?;
+    let src_mint = Pubkey::from_str(&req.src_mint).map_err(|e| eyre::eyre!("src_mint: {e}"))?;
+    let dst_mint = Pubkey::from_str(&req.dst_mint).map_err(|e| eyre::eyre!("dst_mint: {e}"))?;
+
+    // Inject fresh pool state (market + both vaults) from the Yellowstone cache.
+    for acc in &req.accounts {
+        let pk = Pubkey::from_str(&acc.pubkey).map_err(|e| eyre::eyre!("acc {}: {e}", acc.pubkey))?;
+        let data = B64.decode(&acc.data).map_err(|e| eyre::eyre!("data {}: {e}", acc.pubkey))?;
+        let owner_bytes: [u8; 32] = bs58::decode(&acc.owner)
+            .into_vec()
+            .map_err(|e| eyre::eyre!("owner {}: {e}", acc.pubkey))?
+            .try_into()
+            .map_err(|_| eyre::eyre!("owner not 32 bytes for {}", acc.pubkey))?;
+        svm.set_account(pk, Account {
+            lamports: acc.lamports,
+            data,
+            owner: Pubkey::from(owner_bytes),
+            executable: acc.executable,
+            rent_epoch: acc.rent_epoch,
+        })?;
+    }
+
+    // Mints (WSOL = 9, USDC = 6).
+    svm.set_account(src_mint, Misc::mk_mint_acc(9))?;
+    svm.set_account(dst_mint, Misc::mk_mint_acc(6))?;
+
+    // Sim wallet ATAs: src funded with amount_in, dst empty.
+    let sim_src_ta = get_associated_token_address(&sim_wallet.pubkey(), &src_mint);
+    let sim_dst_ta = get_associated_token_address(&sim_wallet.pubkey(), &dst_mint);
+    svm.set_account(sim_src_ta, Misc::mk_ata(&src_mint, &sim_wallet.pubkey(), req.amount_in))?;
+    svm.set_account(sim_dst_ta, Misc::mk_ata(&dst_mint, &sim_wallet.pubkey(), 0))?;
+
+    // Re-fund sim wallet for fees.
+    svm.set_account(sim_wallet.pubkey(), Account {
+        lamports: consts::AIRDROP_AMOUNT,
+        data: vec![],
+        owner: solana_sdk::system_program::id(),
+        executable: false,
+        rent_epoch: u64::MAX,
+    })?;
+
+    // Real wallet ATAs — referenced by the instruction we RETURN (for the live tx).
+    let real_src_ta = get_associated_token_address(&fee_payer, &src_mint);
+    let real_dst_ta = get_associated_token_address(&fee_payer, &dst_mint);
+
+    // Build the DFlow swap2 (spoof-Magnus) instruction for BisonFi, real accounts.
+    let routes: Vec<Vec<magnus_router_client::types::Route>> =
+        vec![vec![Route { dexes: vec![Dex::BisonFi], weights: vec![100] }.into()]];
+    let data = SwapArgs {
+        amount_in: req.amount_in,
+        expect_amount_out: 1,
+        min_return: 1,
+        amounts: vec![req.amount_in],
+        routes,
+    };
+    let mut construct = ConstructSwap {
+        cfg: cfg.clone(),
+        remaining_accounts: vec![],
+        payer: fee_payer,
+        src_ta: real_src_ta,
+        dst_ta: real_dst_ta,
+        src_mint,
+        dst_mint,
+    };
+    construct.attach_pmm_accs(&Dex::BisonFi, &market);
+    let real_ix = construct.instruction(Some(Aggregator::DFlow), data, Misc::gen_order_id());
+
+    // Simulate a copy with the real fee_payer/ATAs remapped onto the sim wallet.
+    let mut replace: HashMap<Pubkey, Pubkey> = HashMap::new();
+    replace.insert(fee_payer, sim_wallet.pubkey());
+    replace.insert(real_src_ta, sim_src_ta);
+    replace.insert(real_dst_ta, sim_dst_ta);
+    let sim_accounts: Vec<AccountMeta> = real_ix.accounts.iter().map(|a| {
+        let pk = *replace.get(&a.pubkey).unwrap_or(&a.pubkey);
+        match (a.is_writable, a.is_signer) {
+            (true, true) => AccountMeta::new(pk, true),
+            (true, false) => AccountMeta::new(pk, false),
+            (false, true) => AccountMeta::new_readonly(pk, true),
+            (false, false) => AccountMeta::new_readonly(pk, false),
+        }
+    }).collect();
+    let sim_ix = Instruction {
+        program_id: real_ix.program_id,
+        accounts: sim_accounts,
+        data: real_ix.data.clone(),
+    };
+
+    let initial_dst = token_balance_from_svm(svm, &sim_dst_ta);
+    let tx = Transaction::new_signed_with_payer(
+        &[sim_ix],
+        Some(&sim_wallet.pubkey()),
+        &[sim_wallet],
+        svm.latest_blockhash(),
+    );
+
+    match svm.send_transaction(tx) {
+        Ok(meta) => {
+            let final_dst = token_balance_from_svm(svm, &sim_dst_ta);
+            let amount_out = final_dst.checked_sub(initial_dst);
+            let out_ix = OutInstruction {
+                program_id: real_ix.program_id.to_string(),
+                accounts: real_ix.accounts.iter().map(|a| OutAccountMeta {
+                    pubkey: a.pubkey.to_string(),
+                    is_signer: a.is_signer,
+                    is_writable: a.is_writable,
+                }).collect(),
+                data: B64.encode(&real_ix.data),
+            };
+            Ok(BuildBisonResponse {
+                id: req.id,
+                success: true,
+                amount_out,
+                compute_units: Some(meta.compute_units_consumed),
+                instruction: Some(out_ix),
+                error: None,
+            })
+        }
+        Err(failed) => Ok(BuildBisonResponse {
+            id: req.id,
+            success: false,
+            amount_out: None,
+            compute_units: Some(failed.meta.compute_units_consumed),
+            instruction: None,
+            error: Some(format!("{:?}", failed.err)),
+        }),
+    }
 }
 
 // ── SVM initialisation ────────────────────────────────────────────────────────

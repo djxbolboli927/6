@@ -1,4 +1,5 @@
 mod arbitrage;
+mod bison_test;
 mod blockhash_cache;
 mod config;
 mod jito;
@@ -132,8 +133,25 @@ async fn async_main(config: config::Config) -> Result<()> {
     let pmm_cache = pmm_sim::new_account_cache();
     pmm_sim::preload_cache_from_disk(&config.pmm_sim.accounts_path, &pmm_cache);
 
+    // ── BisonFi first-test mode ────────────────────────────────────────────────
+    // When enabled, the scanner is fully disabled and a single fixed flow runs,
+    // re-triggered live on every pool update. Build the trigger BEFORE the
+    // Yellowstone subscription so no early update is lost.
+    let (bison_trigger, bison_notify) = if config.bison_test.enabled {
+        let (t, n) = bison_test::make_trigger(&config.bison_test);
+        (Some(t), Some(n))
+    } else {
+        (None, None)
+    };
+
     // Load dynamic watchlist from mix.json (all pool accounts for Yellowstone).
-    let mix_watchlist_set = mix_watchlist::load_mix_watchlist(&config.pmm_sim.mix_json_path);
+    let mut mix_watchlist_set = mix_watchlist::load_mix_watchlist(&config.pmm_sim.mix_json_path);
+    // In BisonFi test mode we only need the one pool's accounts streamed live.
+    if config.bison_test.enabled {
+        mix_watchlist_set.insert(config.bison_test.market.clone());
+        mix_watchlist_set.insert(config.bison_test.base_ta.clone());
+        mix_watchlist_set.insert(config.bison_test.quote_ta.clone());
+    }
     let mix_watchlist: Vec<String> = mix_watchlist_set.into_iter().collect();
 
     // Bootstrap account state from RPC before first simulation (optional).
@@ -156,6 +174,7 @@ async fn async_main(config: config::Config) -> Result<()> {
         config.yellowstone_grpc.x_token.clone(),
         mix_watchlist.clone(),
         pmm_cache.clone(),
+        bison_trigger,
     );
     let pmm_engine = pmm_sim::PmmSimEngine::new(config.pmm_sim.clone());
     if config.pmm_sim.enabled {
@@ -184,6 +203,21 @@ async fn async_main(config: config::Config) -> Result<()> {
         )),
         sim_queue: sim_queue.clone(),
     });
+
+    // ── BisonFi first-test mode: run the single fixed flow and never return ─────
+    if config.bison_test.enabled {
+        let notify = bison_notify.expect("bison_notify is Some when bison_test.enabled");
+        bison_test::run_with_notify(
+            config.bison_test.clone(),
+            calc_ctx.clone(),
+            pmm_engine.clone(),
+            pmm_cache.clone(),
+            config.trading.min_profit_lamports,
+            notify,
+        )
+        .await;
+        return Ok(());
+    }
 
     let worker_count = config.performance.calc_workers.max(1);
     let sim_worker_count = config.performance.sim_workers.max(1);

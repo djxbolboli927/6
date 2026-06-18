@@ -11,7 +11,8 @@ step_sol = 0.0002
 # خروجی نهایی on-chain همچنان ورودی + 10000 لمپرت باقی می‌ماند.
 # مثال: 6600 = فقط فرصت‌هایی که هزینه‌ها را پوشش می‌دهند
 #        100000 = فقط فرصت‌های با سود بالا
-min_profit_lamports = 9000
+# تست اول BisonFi: required_out = amount_in + min_profit = 40,000,000 + 6,600
+min_profit_lamports = 6600
 base_fee_lamports = 5000
 tokens_file = "tokens.txt"
 
@@ -156,6 +157,33 @@ endpoints = [
 # تراکنشی امضا نمی‌کند. فقط برای احراز هویت اتصال gRPC استفاده می‌شود.
 auth_keypair = "/root/c/wallet/grpc.json"
 max_bundles_per_second = 5
+
+# pmm-sim subprocess. برای تست BisonFi باید به باینری pmm-sim اشاره کند
+# (نه sim-server)، چون فقط pmm-sim می‌تواند اینستراکشن DFlow swap2 را بسازد.
+[pmm_sim]
+enabled = true
+binary = "./pmm-sim/target/release/pmm-sim"
+setup_path = "./pmm-sim/cfg/setup.toml"
+programs_path = "./pmm-sim/cfg/programs"
+accounts_path = "./pmm-sim/cfg/accounts"
+# build_bison داخل LiteSVM سریع است؛ مهلت کمی بالاتر برای حاشیه‌ی امن.
+timeout_ms = 200
+# در حالت تست، watchlist از خود [bison_test] ساخته می‌شود؛ این مسیر اختیاری است.
+mix_json_path = "/root/metis/1/mix.json"
+rpc_bootstrap = false
+
+# تست اول: فقط یک استخر BisonFi برای تبدیل WSOL→USDC.
+# با enabled=true، اسکنر چندتوکنی کاملاً غیرفعال می‌شود و فقط همین جریان
+# ثابت اجرا می‌گردد و بلافاصله بعد از هر تغییر زنده‌ی استخر دوباره ارزیابی می‌شود.
+[bison_test]
+enabled = true
+market = "8FnX3xo2yYw3EUE6w3nQA4GfXGS9wpK6oj3veJpbFzLo"
+base_ta = "ATRsNGv2nDw7hSMfkUTBoVUDsFDwN7po7KbecyiGWNB4"   # WSOL vault
+quote_ta = "2Y7HATmn9aJBcxCskE5V2U2epmjvkZmB51zTJBbhj4cU"  # USDC vault
+alt = "24MSaP3phDW5gGiCP78SM5n9i8cvKYTotXBqCm7ZGuYb"
+amount_in_lamports = 40000000
+jito_tip_lamports = 1600
+network_fee_lamports = 5000
 
 [template_cache]
 # Tier-1: route_signature دقیق → patch amounts → بدون Metis call
