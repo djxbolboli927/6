@@ -170,7 +170,9 @@ accounts_path = "./pmm-sim/cfg/accounts"
 timeout_ms = 200
 # در حالت تست، watchlist از خود [bison_test] ساخته می‌شود؛ این مسیر اختیاری است.
 mix_json_path = "/root/metis/1/mix.json"
-rpc_bootstrap = false
+# true = موقع استارت state استخر را مستقیم از RPC می‌گیرد تا cache گرم باشد و
+# جریان بدون انتظار برای اولین آپدیت Yellowstone شروع شود.
+rpc_bootstrap = true
 
 # تست اول: فقط یک استخر BisonFi برای تبدیل WSOL→USDC.
 # با enabled=true، اسکنر چندتوکنی کاملاً غیرفعال می‌شود و فقط همین جریان

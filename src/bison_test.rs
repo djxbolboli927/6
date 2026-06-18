@@ -22,7 +22,7 @@
 //! Only the BisonFi leg is built locally (by pmm-sim), as a DFlow `swap2`.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use solana_sdk::signer::Signer;
 
@@ -124,9 +124,19 @@ pub async fn run_with_notify(
     );
     loop {
         run_once(&cfg, &ctx, &engine, &cache, min_profit_lamports).await;
-        notify.notified().await;
+        // Re-evaluate the instant the pool changes (live, low-latency). The
+        // fallback sleep is only a safety net so the test keeps running even if
+        // the Yellowstone stream is quiet — it never adds latency to a real
+        // update, which wakes the `notified()` arm immediately.
+        tokio::select! {
+            _ = notify.notified() => {}
+            _ = tokio::time::sleep(Duration::from_millis(FALLBACK_TICK_MS)) => {}
+        }
     }
 }
+
+/// Safety-net re-evaluation interval when no live pool update arrives.
+const FALLBACK_TICK_MS: u64 = 2000;
 
 async fn run_once(
     cfg: &BisonTestConfig,
