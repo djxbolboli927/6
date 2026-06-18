@@ -313,7 +313,7 @@ fn process_build_bison(
     svm.set_account(sim_wallet.pubkey(), Account {
         lamports: consts::AIRDROP_AMOUNT,
         data: vec![],
-        owner: solana_sdk::system_program::id(),
+        owner: Pubkey::from_str("11111111111111111111111111111111").unwrap(),
         executable: false,
         rent_epoch: u64::MAX,
     })?;
@@ -566,7 +566,7 @@ fn process_request(svm: &mut LiteSVM, sim_wallet: &Keypair, line: &str) -> eyre:
     svm.set_account(sim_wallet.pubkey(), Account {
         lamports: consts::AIRDROP_AMOUNT,
         data: vec![],
-        owner: solana_sdk::system_program::id(),
+        owner: Pubkey::from_str("11111111111111111111111111111111").unwrap(),
         executable: false,
         rent_epoch: u64::MAX,
     })?;
