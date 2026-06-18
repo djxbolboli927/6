@@ -197,7 +197,17 @@ impl PmmSimEngine {
                 eprintln!("[pmm_sim] subprocess started (binary={})", self.cfg.binary);
             }
             Err(e) => {
-                error!("[pmm_sim] failed to spawn subprocess: {e}");
+                let cwd = std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "?".to_string());
+                let resolved = std::path::Path::new(&self.cfg.binary)
+                    .canonicalize()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "<does not exist>".to_string());
+                error!(
+                    "[pmm_sim] failed to spawn subprocess: {e} | binary='{}' resolved='{resolved}' cwd='{cwd}' setup_path='{}' programs_path='{}' — check that this executable exists and is built (cd pmm-sim && cargo build --release)",
+                    self.cfg.binary, self.cfg.setup_path, self.cfg.programs_path,
+                );
             }
         }
     }
