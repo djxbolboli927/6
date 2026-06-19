@@ -11,6 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct BisonMetrics {
     /// Number of live Yellowstone updates for the watched pool accounts.
     pub grpc_pool_updates: AtomicU64,
+    /// Total Yellowstone account updates received (ANY account) — tells us
+    /// whether the subscription is alive at all vs. the pool just being quiet.
+    pub grpc_total_updates: AtomicU64,
     /// Sum / count of inter-update intervals (ms) — used for the average.
     pub grpc_interval_sum_ms: AtomicU64,
     pub grpc_interval_samples: AtomicU64,

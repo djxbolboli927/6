@@ -160,6 +160,7 @@ fn spawn_metrics_reporter(
             interval.tick().await;
 
             let updates = metrics.grpc_pool_updates.swap(0, Relaxed);
+            let total_updates = metrics.grpc_total_updates.swap(0, Relaxed);
             let iv_sum = metrics.grpc_interval_sum_ms.swap(0, Relaxed);
             let iv_n = metrics.grpc_interval_samples.swap(0, Relaxed);
             let reqs = metrics.build_requests.swap(0, Relaxed);
@@ -177,7 +178,7 @@ fn spawn_metrics_reporter(
 
             eprintln!(
                 "[bison30s] pmm_up={pmm_up} \
-pool_grpc_updates={updates} avg_update_interval_ms={avg_iv} \
+grpc_total_updates={total_updates} pool_grpc_updates={updates} avg_update_interval_ms={avg_iv} \
 pool_accounts_in_cache={}/{} cache_slot={slot} missing=[{}] \
 bot->pmm_requests={reqs} pmm->bot_responses={resps} build_success={succ} \
 avg_pmm_resp_us={avg_rt}",
@@ -248,7 +249,7 @@ async fn run_once(
     metrics.record_build_response(build_us, build_ok);
     if !build.success {
         eprintln!(
-            "[bison_test] skip: BisonFi sim failed error={}",
+            "[bison_test] skip: BisonFi sim failed slot={slot} error={}",
             build.error.as_deref().unwrap_or("unknown")
         );
         return;

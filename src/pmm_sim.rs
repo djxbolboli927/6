@@ -374,8 +374,14 @@ async fn run_subscription(
 ) -> anyhow::Result<()> {
     let channel = Channel::from_shared(endpoint.to_string())?
         .tls_config(tonic::transport::ClientTlsConfig::new().with_enabled_roots())?
+        // Keep the HTTP/2 connection alive even when idle so the server does not
+        // drop a long-lived account subscription.
+        .http2_keep_alive_interval(Duration::from_secs(10))
+        .keep_alive_timeout(Duration::from_secs(20))
+        .keep_alive_while_idle(true)
         .connect()
         .await?;
+    eprintln!("[yellowstone] connected endpoint={endpoint} watchlist={}", watchlist.len());
 
     let token_meta = x_token.to_string();
     let mut client = GeyserClient::with_interceptor(channel, move |mut req: Request<()>| {
@@ -408,15 +414,44 @@ async fn run_subscription(
         ..Default::default()
     };
 
-    let stream_req = tokio_stream::once(sub_request);
+    // CRITICAL: keep the request stream OPEN. Using `tokio_stream::once` closes
+    // the client side immediately, and many geyser servers then stop sending
+    // updates. We hold the channel `tx` for the lifetime of the loop (sending
+    // the initial request, then periodic re-sends as keepalive) so the server
+    // keeps the subscription active.
+    let (tx, rx) = tokio::sync::mpsc::channel::<SubscribeRequest>(4);
+    tx.send(sub_request.clone()).await.ok();
+    let keepalive = sub_request.clone();
+    let tx_keep = tx.clone();
+    let keepalive_task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            // Re-asserting the same request keeps the stream open and the
+            // subscription fresh without changing filters.
+            if tx_keep.send(keepalive.clone()).await.is_err() {
+                break;
+            }
+        }
+    });
+    let stream_req = tokio_stream::wrappers::ReceiverStream::new(rx);
     let mut stream = client.subscribe(stream_req).await?.into_inner();
 
     use futures::StreamExt;
 
+    let mut total_updates: u64 = 0;
+    let mut logged_first = false;
     while let Some(msg) = stream.next().await {
         match msg {
             Ok(SubscribeUpdate { update_oneof: Some(proto::subscribe_update::UpdateOneof::Account(acc_update)), .. }) => {
                 let slot = acc_update.slot;
+                total_updates += 1;
+                if let Some(t) = trigger {
+                    t.metrics.grpc_total_updates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                if !logged_first {
+                    logged_first = true;
+                    eprintln!("[yellowstone] first account update received (slot={slot})");
+                }
                 if let Some(info) = acc_update.account {
                     if info.pubkey.len() == 32 {
                         let pubkey = bs58::encode(&info.pubkey).into_string();
@@ -448,6 +483,9 @@ async fn run_subscription(
             }
         }
     }
+    keepalive_task.abort();
+    drop(tx);
+    warn!("[yellowstone] subscription stream ended (received {total_updates} account updates this session) — will reconnect");
     Ok(())
 }
 
