@@ -171,14 +171,14 @@ fn spawn_metrics_reporter(
             let avg_rt = if rt_n > 0 { rt_sum / rt_n } else { 0 };
 
             // Live cache warmth for the pool accounts.
-            let (found, missing) = pmm_sim::collect_accounts_by_pubkey(&keys, &cache);
+            let (found, missing, slot) = pmm_sim::collect_accounts_by_pubkey(&keys, &cache);
             let pmm_up = engine.is_running().await;
             metrics.set_pmm_up(pmm_up);
 
             eprintln!(
                 "[bison30s] pmm_up={pmm_up} \
 pool_grpc_updates={updates} avg_update_interval_ms={avg_iv} \
-pool_accounts_in_cache={}/{} missing=[{}] \
+pool_accounts_in_cache={}/{} cache_slot={slot} missing=[{}] \
 bot->pmm_requests={reqs} pmm->bot_responses={resps} build_success={succ} \
 avg_pmm_resp_us={avg_rt}",
                 found.len(),
@@ -210,7 +210,7 @@ async fn run_once(
 
     // ── 1. Gather fresh pool state from the Yellowstone cache ──────────────────
     let pool_keys = vec![cfg.market.clone(), cfg.base_ta.clone(), cfg.quote_ta.clone()];
-    let (accounts, missing) = pmm_sim::collect_accounts_by_pubkey(&pool_keys, cache);
+    let (accounts, missing, slot) = pmm_sim::collect_accounts_by_pubkey(&pool_keys, cache);
     if !missing.is_empty() {
         eprintln!(
             "[bison_test] skip: pool state not warm yet, missing=[{}]",
@@ -229,6 +229,7 @@ async fn run_once(
         src_mint: WSOL_MINT.to_string(),
         dst_mint: USDC_MINT.to_string(),
         amount_in,
+        slot,
         accounts,
     };
 

@@ -151,6 +151,10 @@ struct BuildBisonRequest {
     src_mint: String,
     dst_mint: String,
     amount_in: u64,
+    /// Chain slot the injected account state belongs to. The LiteSVM clock is
+    /// warped to it so time/slot-sensitive PMMs (BisonFi) accept the snapshot.
+    #[serde(default)]
+    slot: u64,
     accounts: Vec<ServeAccount>,
 }
 
@@ -299,6 +303,13 @@ fn process_build_bison(
         })?;
     }
 
+    // Warp the clock to the snapshot's slot so slot/time-sensitive PMMs
+    // (BisonFi validates against the current slot) accept the injected state.
+    // Without this the SVM runs at genesis (slot 0) and BisonFi rejects early.
+    if req.slot > 0 {
+        svm.warp_to_slot(req.slot);
+    }
+
     // Mints (WSOL = 9, USDC = 6).
     svm.set_account(src_mint, Misc::mk_mint_acc(9))?;
     svm.set_account(dst_mint, Misc::mk_mint_acc(6))?;
@@ -394,14 +405,20 @@ fn process_build_bison(
                 error: None,
             })
         }
-        Err(failed) => Ok(BuildBisonResponse {
-            id: req.id,
-            success: false,
-            amount_out: None,
-            compute_units: Some(failed.meta.compute_units_consumed),
-            instruction: None,
-            error: Some(format!("{:?}", failed.err)),
-        }),
+        Err(failed) => {
+            // Include the program logs — they carry the real cause behind the
+            // bare error code (e.g. BisonFi "slippage"/"direction"/"amount").
+            let logs = failed.meta.logs.join(" | ");
+            eprintln!("[pmm-sim build_bison] FAILED err={:?} logs=[{}]", failed.err, logs);
+            Ok(BuildBisonResponse {
+                id: req.id,
+                success: false,
+                amount_out: None,
+                compute_units: Some(failed.meta.compute_units_consumed),
+                instruction: None,
+                error: Some(format!("{:?} | logs: {}", failed.err, logs)),
+            })
+        }
     }
 }
 

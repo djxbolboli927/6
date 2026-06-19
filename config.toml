@@ -187,11 +187,6 @@ amount_in_lamports = 40000000
 jito_tip_lamports = 1600
 network_fee_lamports = 5000
 
-[template_cache]
-# Tier-1: route_signature دقیق → patch amounts → بدون Metis call
-# Tier-2: hop-pair index (هر دو pool دیده شده) → patch amounts → بدون Metis call
-# Tier-3: fallback به /swap-instructions + ذخیره template برای دفعات بعد
-force_fresh_metis_all = false
-save_new = true
-serve_route = true
-serve_from_metis = true
+# نکته: بخش [template_cache] حذف شد — هیچ کدی آن را نمی‌خواند (ماژول template_cache
+# قبلاً حذف شده) و در حالت bison_test اسکنر کاملاً خاموش است، پس هیچ اینستراکشنی
+# از RAM ساخته نمی‌شود؛ همه‌ی اینستراکشن‌های Jupiter مستقیم از Metis گرفته می‌شوند.

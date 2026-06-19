@@ -38,6 +38,10 @@ pub struct CachedAccount {
     pub owner: [u8; 32],
     pub executable: bool,
     pub rent_epoch: u64,
+    /// Chain slot this state belongs to (Yellowstone update slot / RPC context
+    /// slot / disk-snapshot slot). Used to warp the LiteSVM clock so
+    /// slot-sensitive PMMs accept the snapshot.
+    pub slot: u64,
 }
 
 /// Thread-safe map from base58 pubkey string → account state.
@@ -124,6 +128,8 @@ pub struct BuildBisonRequest {
     pub src_mint: String,
     pub dst_mint: String,
     pub amount_in: u64,
+    /// Chain slot the account snapshot belongs to (warps the sim clock).
+    pub slot: u64,
     /// Fresh pool account state (market + both vaults) from the Yellowstone cache.
     pub accounts: Vec<IpcAccount>,
 }
@@ -410,6 +416,7 @@ async fn run_subscription(
     while let Some(msg) = stream.next().await {
         match msg {
             Ok(SubscribeUpdate { update_oneof: Some(proto::subscribe_update::UpdateOneof::Account(acc_update)), .. }) => {
+                let slot = acc_update.slot;
                 if let Some(info) = acc_update.account {
                     if info.pubkey.len() == 32 {
                         let pubkey = bs58::encode(&info.pubkey).into_string();
@@ -419,6 +426,7 @@ async fn run_subscription(
                             owner: info.owner.as_slice().try_into().unwrap_or([0u8; 32]),
                             executable: info.executable,
                             rent_epoch: info.rent_epoch,
+                            slot,
                         };
                         if let Ok(mut w) = cache.write() {
                             w.insert(pubkey.clone(), cached);
@@ -478,27 +486,31 @@ pub fn collect_all_instruction_accounts(
 pub fn collect_accounts_by_pubkey(
     pubkeys: &[String],
     cache: &AccountCache,
-) -> (Vec<IpcAccount>, Vec<String>) {
+) -> (Vec<IpcAccount>, Vec<String>, u64) {
     let mut found = Vec::new();
     let mut missing = Vec::new();
+    let mut max_slot = 0u64;
     let r = match cache.read() {
         Ok(r) => r,
-        Err(_) => return (found, pubkeys.to_vec()),
+        Err(_) => return (found, pubkeys.to_vec(), 0),
     };
     for pk in pubkeys {
         match r.get(pk) {
-            Some(acc) => found.push(IpcAccount {
-                pubkey: pk.clone(),
-                lamports: acc.lamports,
-                data: B64.encode(&acc.data),
-                owner: bs58::encode(acc.owner).into_string(),
-                executable: acc.executable,
-                rent_epoch: acc.rent_epoch,
-            }),
+            Some(acc) => {
+                max_slot = max_slot.max(acc.slot);
+                found.push(IpcAccount {
+                    pubkey: pk.clone(),
+                    lamports: acc.lamports,
+                    data: B64.encode(&acc.data),
+                    owner: bs58::encode(acc.owner).into_string(),
+                    executable: acc.executable,
+                    rent_epoch: acc.rent_epoch,
+                });
+            }
             None => missing.push(pk.clone()),
         }
     }
-    (found, missing)
+    (found, missing, max_slot)
 }
 
 /// Bootstrap account cache from RPC using batched getMultipleAccounts.
@@ -508,6 +520,7 @@ pub fn bootstrap_from_rpc(
     rpc: &solana_client::rpc_client::RpcClient,
     batch_size: usize,
 ) {
+    use solana_sdk::commitment_config::CommitmentConfig;
     use solana_sdk::pubkey::Pubkey;
     let batch_size = batch_size.min(100).max(1);
     let mut total = 0usize;
@@ -516,10 +529,13 @@ pub fn bootstrap_from_rpc(
         let pubkeys: Vec<Pubkey> = chunk.iter()
             .filter_map(|s| s.parse().ok())
             .collect();
-        match rpc.get_multiple_accounts(&pubkeys) {
-            Ok(accounts) => {
+        // Use the *with_commitment* variant so we get the context slot the data
+        // belongs to — needed to warp the sim clock for slot-sensitive PMMs.
+        match rpc.get_multiple_accounts_with_commitment(&pubkeys, CommitmentConfig::processed()) {
+            Ok(resp) => {
+                let slot = resp.context.slot;
                 let mut w = match cache.write() { Ok(w) => w, Err(_) => continue };
-                for (pk, maybe_acc) in pubkeys.iter().zip(accounts.iter()) {
+                for (pk, maybe_acc) in pubkeys.iter().zip(resp.value.iter()) {
                     if let Some(acc) = maybe_acc {
                         w.insert(pk.to_string(), CachedAccount {
                             lamports: acc.lamports,
@@ -527,6 +543,7 @@ pub fn bootstrap_from_rpc(
                             owner: acc.owner.to_bytes(),
                             executable: acc.executable,
                             rent_epoch: acc.rent_epoch,
+                            slot,
                         });
                         total += 1;
                     }
@@ -590,10 +607,11 @@ pub fn preload_cache_from_disk(accounts_path: &str, cache: &AccountCache) {
                 let owner: [u8; 32] = owner_bytes.try_into().unwrap_or([0u8; 32]);
                 let executable = v["account"]["executable"].as_bool().unwrap_or(false);
                 let rent_epoch = v["account"]["rentEpoch"].as_u64().unwrap_or(u64::MAX);
+                let slot = v["slot"].as_u64().unwrap_or(0);
 
                 if !pubkey.is_empty() {
                     if let Ok(mut w) = cache.write() {
-                        w.insert(pubkey, CachedAccount { lamports, data, owner, executable, rent_epoch });
+                        w.insert(pubkey, CachedAccount { lamports, data, owner, executable, rent_epoch, slot });
                         loaded += 1;
                     }
                 }
