@@ -387,6 +387,10 @@ fn process_build_bison(
         Ok(meta) => {
             let final_dst = token_balance_from_svm(svm, &sim_dst_ta);
             let amount_out = final_dst.checked_sub(initial_dst);
+            eprintln!(
+                "[pmm-sim build_bison] OK market={} amount_in={} amount_out_usdc={} spoof=dflow slot={} cu={}",
+                req.market, req.amount_in, amount_out.unwrap_or(0), req.slot, meta.compute_units_consumed,
+            );
             let out_ix = OutInstruction {
                 program_id: real_ix.program_id.to_string(),
                 accounts: real_ix.accounts.iter().map(|a| OutAccountMeta {

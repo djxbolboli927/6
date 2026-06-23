@@ -186,6 +186,9 @@ alt = "24MSaP3phDW5gGiCP78SM5n9i8cvKYTotXBqCm7ZGuYb"
 amount_in_lamports = 40000000
 jito_tip_lamports = 1600
 network_fee_lamports = 5000
+# true = فقط قیمت BisonFi WSOL→USDC (spoof=dflow) شبیه‌سازی و log می‌شود؛
+# هیچ تماسی با Metis/Jito و ساخت باندل انجام نمی‌شود (فاز فعلی: فقط قیمت).
+price_only = true
 
 # نکته: بخش [template_cache] حذف شد — هیچ کدی آن را نمی‌خواند (ماژول template_cache
 # قبلاً حذف شده) و در حالت bison_test اسکنر کاملاً خاموش است، پس هیچ اینستراکشنی

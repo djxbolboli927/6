@@ -362,11 +362,17 @@ pub struct BisonTestConfig {
     /// Standard network fee assumed for the break-even floor (test value: 5000).
     #[serde(default = "default_bison_network_fee")]
     pub network_fee_lamports: u64,
+    /// When true, stop after simulating the BisonFi price (log it) — do NOT call
+    /// Metis, build a token-ledger bundle, or send to Jito. Price-only mode for
+    /// validating the BisonFi WSOL->USDC (spoof=dflow) simulation in isolation.
+    #[serde(default = "default_bison_price_only")]
+    pub price_only: bool,
 }
 
 fn default_bison_amount_in() -> u64 { 40_000_000 }
 fn default_bison_jito_tip() -> u64 { 1_600 }
 fn default_bison_network_fee() -> u64 { 5_000 }
+fn default_bison_price_only() -> bool { true }
 
 impl Default for BisonTestConfig {
     fn default() -> Self {
@@ -379,6 +385,7 @@ impl Default for BisonTestConfig {
             amount_in_lamports: default_bison_amount_in(),
             jito_tip_lamports: default_bison_jito_tip(),
             network_fee_lamports: default_bison_network_fee(),
+            price_only: default_bison_price_only(),
         }
     }
 }

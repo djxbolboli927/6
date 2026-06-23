@@ -261,6 +261,20 @@ async fn run_once(
             return;
         }
     };
+
+    // ── Price log (acceptance criteria) ────────────────────────────────────────
+    eprintln!(
+        "[bison_price] market={} market_base_ta={} market_quote_ta={} amount_in={} amount_out_usdc={} spoof=dflow slot={} source=live_cache cu={}",
+        cfg.market, cfg.base_ta, cfg.quote_ta, amount_in, predicted_usdc, slot,
+        build.compute_units.unwrap_or(0),
+    );
+
+    // Price-only mode: we have the BisonFi WSOL->USDC rate for caller=DFlow.
+    // Do not call Metis, build a bundle, or send to Jito.
+    if cfg.price_only {
+        return;
+    }
+
     let bison_ix_out = match build.instruction {
         Some(ix) => ix,
         None => {
