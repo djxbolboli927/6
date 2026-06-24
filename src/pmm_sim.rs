@@ -518,6 +518,23 @@ pub fn collect_all_instruction_accounts(
     result
 }
 
+/// Read a cached account's raw data bytes (e.g. to parse a market account).
+pub fn get_cached_data(cache: &AccountCache, pubkey: &str) -> Option<Vec<u8>> {
+    cache.read().ok()?.get(pubkey).map(|a| a.data.clone())
+}
+
+/// Derive a BisonFi market's REAL base/quote vault token accounts from its
+/// market account data. Layout: magic "POOLSTAT", base_ta@120, quote_ta@152.
+/// Returns base58 (base_ta, quote_ta). Authoritative — does not trust mix.json.
+pub fn parse_bisonfi_vaults(market_data: &[u8]) -> Option<(String, String)> {
+    if market_data.len() < 248 || &market_data[0..8] != b"POOLSTAT" {
+        return None;
+    }
+    let base = bs58::encode(&market_data[120..152]).into_string();
+    let quote = bs58::encode(&market_data[152..184]).into_string();
+    Some((base, quote))
+}
+
 /// Collect `IpcAccount`s for an explicit list of pubkeys from the cache.
 /// Returns only the ones currently present; missing pubkeys are reported via
 /// the second element so the caller can decide whether state is warm enough.

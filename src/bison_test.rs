@@ -209,12 +209,54 @@ async fn run_once(
         .saturating_add(cfg.jito_tip_lamports)
         .saturating_add(cfg.network_fee_lamports);
 
-    // ── 1. Gather fresh pool state from the Yellowstone cache ──────────────────
-    let pool_keys = vec![cfg.market.clone(), cfg.base_ta.clone(), cfg.quote_ta.clone()];
-    let (accounts, missing, slot) = pmm_sim::collect_accounts_by_pubkey(&pool_keys, cache);
+    // ── 1. Gather fresh pool state from the cache ──────────────────────────────
+    // The market account is authoritative: it stores its real vault token
+    // accounts (base_ta@120, quote_ta@152). We DERIVE them from the market data
+    // rather than trusting mix.json/config (whose vaults caused BisonFi 0x1a).
+    let market_data = match pmm_sim::get_cached_data(cache, &cfg.market) {
+        Some(d) => d,
+        None => {
+            eprintln!("[bison_test] skip: market state not warm yet ({})", cfg.market);
+            return;
+        }
+    };
+    let (base_ta, quote_ta) = match pmm_sim::parse_bisonfi_vaults(&market_data) {
+        Some(v) => v,
+        None => {
+            eprintln!(
+                "[bison_test] skip: cannot parse BisonFi market {} (len={}, not a POOLSTAT account?)",
+                cfg.market, market_data.len()
+            );
+            return;
+        }
+    };
+    if base_ta != cfg.base_ta || quote_ta != cfg.quote_ta {
+        eprintln!(
+            "[bison_test] note: using vaults derived from market data base_ta={base_ta} quote_ta={quote_ta} (config had base_ta={} quote_ta={})",
+            cfg.base_ta, cfg.quote_ta
+        );
+    }
+
+    let pool_keys = vec![cfg.market.clone(), base_ta.clone(), quote_ta.clone()];
+    let (mut accounts, mut missing, mut slot) =
+        pmm_sim::collect_accounts_by_pubkey(&pool_keys, cache);
+    if !missing.is_empty() {
+        // The derived vaults may not be in the cache yet — fetch them once from RPC.
+        let rpc = ctx.rpc_client.clone();
+        let cache_c = cache.clone();
+        let to_fetch = missing.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            pmm_sim::bootstrap_from_rpc(&to_fetch, &cache_c, &rpc, to_fetch.len().max(1));
+        })
+        .await;
+        let r = pmm_sim::collect_accounts_by_pubkey(&pool_keys, cache);
+        accounts = r.0;
+        missing = r.1;
+        slot = r.2;
+    }
     if !missing.is_empty() {
         eprintln!(
-            "[bison_test] skip: pool state not warm yet, missing=[{}]",
+            "[bison_test] skip: pool state not warm (missing after RPC fetch=[{}])",
             missing.join(",")
         );
         return;
@@ -265,7 +307,7 @@ async fn run_once(
     // ── Price log (acceptance criteria) ────────────────────────────────────────
     eprintln!(
         "[bison_price] market={} market_base_ta={} market_quote_ta={} amount_in={} amount_out_usdc={} spoof=dflow slot={} source=live_cache cu={}",
-        cfg.market, cfg.base_ta, cfg.quote_ta, amount_in, predicted_usdc, slot,
+        cfg.market, base_ta, quote_ta, amount_in, predicted_usdc, slot,
         build.compute_units.unwrap_or(0),
     );
 

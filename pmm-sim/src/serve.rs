@@ -188,18 +188,19 @@ fn router_program_id() -> Pubkey {
     magnus_router_client::programs::ROUTER_ID
 }
 
-fn aggregator_for_program(program_id: &Pubkey) -> Option<Aggregator> {
-    if *program_id == Aggregator::Jupiter.program_id() {
-        Some(Aggregator::Jupiter)
-    } else if *program_id == Aggregator::DFlow.program_id() {
-        Some(Aggregator::DFlow)
-    } else if *program_id == Aggregator::OkxLabs.program_id() {
-        Some(Aggregator::OkxLabs)
-    } else if *program_id == Aggregator::Titan.program_id() {
-        Some(Aggregator::Titan)
-    } else {
-        None
+/// Derive a BisonFi market's REAL base/quote vault token accounts from the
+/// market account data. Layout (observed, stable across BisonFi markets):
+///   bytes[0..8]   = b"POOLSTAT" magic
+///   bytes[120..152] = base vault token account
+///   bytes[152..184] = quote vault token account
+///   bytes[184..216] = base mint, bytes[216..248] = quote mint
+fn bisonfi_vaults_from_market(data: &[u8]) -> Option<(Pubkey, Pubkey)> {
+    if data.len() < 248 || &data[0..8] != b"POOLSTAT" {
+        return None;
     }
+    let base: [u8; 32] = data[120..152].try_into().ok()?;
+    let quote: [u8; 32] = data[152..184].try_into().ok()?;
+    Some((Pubkey::from(base), Pubkey::from(quote)))
 }
 
 // ── Serve entry point ─────────────────────────────────────────────────────────
@@ -332,6 +333,38 @@ fn process_build_bison(
     // Real wallet ATAs — referenced by the instruction we RETURN (for the live tx).
     let real_src_ta = get_associated_token_address(&fee_payer, &src_mint);
     let real_dst_ta = get_associated_token_address(&fee_payer, &dst_mint);
+
+    // Derive the BisonFi market's REAL vault token accounts from the market
+    // account data itself (layout: magic "POOLSTAT", base_ta@120, quote_ta@152,
+    // baseMint@184, quoteMint@216). This is authoritative — it does NOT trust
+    // the setup.toml / mix.json vault addresses, which are a common source of
+    // wrong-account errors (BisonFi custom error 0x1a / 26).
+    let market_data: Option<Vec<u8>> = req
+        .accounts
+        .iter()
+        .find(|a| a.pubkey == req.market)
+        .and_then(|a| B64.decode(&a.data).ok());
+    let cfg = match market_data.as_deref().and_then(bisonfi_vaults_from_market) {
+        Some((base_ta, quote_ta)) => {
+            eprintln!(
+                "[pmm-sim build_bison] derived vaults market={} base_ta={base_ta} quote_ta={quote_ta}",
+                req.market
+            );
+            let mut c = cfg.clone();
+            let mut swap_v1 = indexmap::IndexMap::new();
+            swap_v1.insert(market, crate::cfg::BisonfiSwapV1 { market, market_base_ta: base_ta, market_quote_ta: quote_ta });
+            c.bisonfi = Some(crate::cfg::BisonfiCfg { swap_v1 });
+            c
+        }
+        None => {
+            eprintln!(
+                "[pmm-sim build_bison] WARN could not derive vaults from market {} data (len={:?}) — falling back to setup.toml",
+                req.market,
+                market_data.as_ref().map(|d| d.len())
+            );
+            cfg.clone()
+        }
+    };
 
     // Build the DFlow swap2 (spoof-Magnus) instruction for BisonFi, real accounts.
     let routes: Vec<Vec<magnus_router_client::types::Route>> =
