@@ -273,6 +273,7 @@ async fn run_once(
         dst_mint: USDC_MINT.to_string(),
         amount_in,
         slot,
+        direct: true,
         accounts,
     };
 

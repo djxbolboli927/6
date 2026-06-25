@@ -130,6 +130,8 @@ pub struct BuildBisonRequest {
     pub amount_in: u64,
     /// Chain slot the account snapshot belongs to (warps the sim clock).
     pub slot: u64,
+    /// Call BisonFi directly (no Magnus/DFlow spoof router) for the price.
+    pub direct: bool,
     /// Fresh pool account state (market + both vaults) from the Yellowstone cache.
     pub accounts: Vec<IpcAccount>,
 }

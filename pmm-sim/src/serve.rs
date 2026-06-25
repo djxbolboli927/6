@@ -155,6 +155,11 @@ struct BuildBisonRequest {
     /// warped to it so time/slot-sensitive PMMs (BisonFi) accept the snapshot.
     #[serde(default)]
     slot: u64,
+    /// When true, call the BisonFi program DIRECTLY (no Magnus/DFlow spoof
+    /// router) — a plain top-level swap. Used to read the price without the
+    /// router CPI path that v3 pools reject.
+    #[serde(default)]
+    direct: bool,
     accounts: Vec<ServeAccount>,
 }
 
@@ -366,27 +371,80 @@ fn process_build_bison(
         }
     };
 
-    // Build the DFlow swap2 (spoof-Magnus) instruction for BisonFi, real accounts.
-    let routes: Vec<Vec<magnus_router_client::types::Route>> =
-        vec![vec![Route { dexes: vec![Dex::BisonFi], weights: vec![100] }.into()]];
-    let data = SwapArgs {
-        amount_in: req.amount_in,
-        expect_amount_out: 1,
-        min_return: 1,
-        amounts: vec![req.amount_in],
-        routes,
+    // Build the swap instruction. Either a DIRECT BisonFi call (no router) or
+    // the DFlow swap2 (spoof-Magnus) router path.
+    let real_ix = if req.direct {
+        // Direct top-level BisonFi swap (selector 0x02 + amount + min(0) + dir).
+        // Derive base/quote vault + base mint from the market data to set direction.
+        let (base_ta, quote_ta) = market_data
+            .as_deref()
+            .and_then(bisonfi_vaults_from_market)
+            .ok_or_else(|| eyre::eyre!("cannot derive vaults for direct BisonFi"))?;
+        let base_mint = market_data
+            .as_deref()
+            .and_then(|d| {
+                if d.len() >= 216 {
+                    let arr: [u8; 32] = d[184..216].try_into().ok()?;
+                    Some(Pubkey::from(arr))
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| eyre::eyre!("cannot derive base mint"))?;
+        // src is base => direction 0 and (user_base, user_quote) = (src, dst).
+        let src_is_base = src_mint == base_mint;
+        let (dir, user_base, user_quote) = if src_is_base {
+            (0u8, real_src_ta, real_dst_ta)
+        } else {
+            (1u8, real_dst_ta, real_src_ta)
+        };
+        let mut data = vec![0x02u8];
+        data.extend_from_slice(&req.amount_in.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.push(dir);
+        let bisonfi_pid = Pubkey::new_from_array(magnus_shared::pmm_bisonfi::id().to_bytes());
+        eprintln!(
+            "[pmm-sim build_bison] DIRECT market={} base_ta={base_ta} quote_ta={quote_ta} dir={dir}",
+            req.market
+        );
+        Instruction {
+            program_id: bisonfi_pid,
+            accounts: vec![
+                AccountMeta::new(fee_payer, true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(base_ta, false),
+                AccountMeta::new(quote_ta, false),
+                AccountMeta::new(user_base, false),
+                AccountMeta::new(user_quote, false),
+                AccountMeta::new_readonly(Pubkey::new_from_array(magnus_shared::spl_token::id().to_bytes()), false),
+                AccountMeta::new_readonly(Pubkey::new_from_array(magnus_shared::spl_token::id().to_bytes()), false),
+                AccountMeta::new_readonly(solana_sdk::sysvar::instructions::id(), false),
+            ],
+            data,
+        }
+    } else {
+        // Build the DFlow swap2 (spoof-Magnus) instruction for BisonFi.
+        let routes: Vec<Vec<magnus_router_client::types::Route>> =
+            vec![vec![Route { dexes: vec![Dex::BisonFi], weights: vec![100] }.into()]];
+        let data = SwapArgs {
+            amount_in: req.amount_in,
+            expect_amount_out: 1,
+            min_return: 1,
+            amounts: vec![req.amount_in],
+            routes,
+        };
+        let mut construct = ConstructSwap {
+            cfg: cfg.clone(),
+            remaining_accounts: vec![],
+            payer: fee_payer,
+            src_ta: real_src_ta,
+            dst_ta: real_dst_ta,
+            src_mint,
+            dst_mint,
+        };
+        construct.attach_pmm_accs(&Dex::BisonFi, &market);
+        construct.instruction(Some(Aggregator::DFlow), data, Misc::gen_order_id())
     };
-    let mut construct = ConstructSwap {
-        cfg: cfg.clone(),
-        remaining_accounts: vec![],
-        payer: fee_payer,
-        src_ta: real_src_ta,
-        dst_ta: real_dst_ta,
-        src_mint,
-        dst_mint,
-    };
-    construct.attach_pmm_accs(&Dex::BisonFi, &market);
-    let real_ix = construct.instruction(Some(Aggregator::DFlow), data, Misc::gen_order_id());
 
     // Simulate a copy with the real fee_payer/ATAs remapped onto the sim wallet.
     let mut replace: HashMap<Pubkey, Pubkey> = HashMap::new();
