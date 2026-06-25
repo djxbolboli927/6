@@ -201,3 +201,10 @@ market_quote_ta = "6DMF4t6Ks8yXhG8K3rrTAeNYrqNrr1DwewHvBmH3a3FX"
 market = "FC9pWtfdtbyGZ5WHTLneoMSUx6jmTDgqKaxDcm2trsND"
 market_base_ta = "CL9xU6uijD4FL3ximjt65R6YhUHm1qtiTbBvW1s9TXHZ"
 market_quote_ta = "Dp4c6UyCHy6N4Xmg2URwq77SGWCRFGKQJFuDnCkXVUF4"
+
+# WSOL/USDC pool used by the first-test (bison_test) flow.
+# base = WSOL vault, quote = USDC vault. Live state streamed from Yellowstone.
+[[bisonfi.swap-v1]]
+market = "8FnX3xo2yYw3EUE6w3nQA4GfXGS9wpK6oj3veJpbFzLo"
+market_base_ta = "ATRsNGv2nDw7hSMfkUTBoVUDsFDwN7po7KbecyiGWNB4"
+market_quote_ta = "2Y7HATmn9aJBcxCskE5V2U2epmjvkZmB51zTJBbhj4cU"

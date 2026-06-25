@@ -1,0 +1,29 @@
+# Dedicated pmm-sim setup for the single target pool: BisonFi WSOL/USDC.
+# Purpose: simulate ONLY the BisonFi WSOL->USDC price for caller/spoof = DFlow.
+# No multi-hop routes, no Metis/Jupiter, no transaction building.
+#
+# Verify the two vault token accounts belong to this market with:
+#   solana account/getTokenAccountsByOwner owner=8FnX..., programId=Tokenkeg...
+#   - mint So111...112  (WSOL) -> market_base_ta
+#   - mint EPjFW...Dt1v (USDC) -> market_quote_ta
+# Then fetch real account state via pmm-sim itself (do NOT hand-edit JSON):
+#   pmm-sim fetch-accounts  --setup-path cfg/setup.bisonfi_8Fn.toml \
+#                           --accounts-path cfg/accounts --pmms=bisonfi --http-url "$RPC_URL"
+#   pmm-sim fetch-programs  --pmms=bisonfi --programs-path cfg/programs --http-url "$RPC_URL"
+
+[[tokens]]
+symbol = "wsol"
+addr = "So11111111111111111111111111111111111111112"
+dec = 9
+
+[[tokens]]
+symbol = "usdc"
+addr = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+dec = 6
+
+[bisonfi]
+
+[[bisonfi.swap-v1]]
+market = "8FnX3xo2yYw3EUE6w3nQA4GfXGS9wpK6oj3veJpbFzLo"
+market_base_ta = "ATRsNGv2nDw7hSMfkUTBoVUDsFDwN7po7KbecyiGWNB4"   # WSOL vault owned by the market
+market_quote_ta = "2Y7HATmn9aJBcxCskE5V2U2epmjvkZmB51zTJBbhj4cU"  # USDC vault owned by the market

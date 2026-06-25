@@ -193,6 +193,129 @@ pub fn build_arb_transaction(
     Ok(tx)
 }
 
+/// Build the BisonFi single-pool first-test transaction.
+///
+/// Instruction order (token-ledger semantics REQUIRE this exact layout):
+///   1. Metis computeBudget instructions (SetComputeUnitLimit / data-size limit).
+///      If Metis returned none, a single SetComputeUnitLimit(`cu_limit`) is added.
+///   2. Metis setup instructions (ATA creation etc.), if any.
+///   3. Metis tokenLedgerInstruction  — snapshots the USDC balance.
+///   4. BisonFi DFlow swap2 instruction (from pmm-sim) — deposits USDC.
+///   5. Metis swap instruction (route_with_token_ledger) — consumes the delta.
+///   6. Metis cleanup instruction, if any.
+///   7. System Program transfer — Jito tip (MUST be last).
+///
+/// `bison_ix` is the instruction built and simulated by pmm-sim, already carrying
+/// the real wallet's accounts. `extra_alts` lets the caller add the BisonFi leg's
+/// own Address Lookup Table in addition to the Metis-provided ones.
+pub fn build_bison_test_transaction(
+    swap_ixs: &SwapInstructionsResponse,
+    bison_ix: &InstructionData,
+    payer: &Keypair,
+    tip_account: &Pubkey,
+    tip_lamports: u64,
+    cu_limit: u32,
+    recent_blockhash: Hash,
+    alt_lookup: &AltLookup,
+    rpc_client: &RpcClient,
+    extra_alts: &[Pubkey],
+) -> Result<VersionedTransaction> {
+    let mut instructions: Vec<Instruction> = Vec::new();
+
+    // 1. Compute budget.
+    if swap_ixs.compute_budget_instructions.is_empty() {
+        instructions.push(Instruction {
+            program_id: Pubkey::from_str("ComputeBudget111111111111111111111111111111")?,
+            accounts: vec![],
+            data: {
+                let mut data = vec![0x02];
+                data.extend_from_slice(&cu_limit.to_le_bytes());
+                data
+            },
+        });
+    } else {
+        for ix in &swap_ixs.compute_budget_instructions {
+            instructions.push(to_sdk_instruction(ix)?);
+        }
+    }
+
+    // 2. Setup instructions.
+    for ix in &swap_ixs.setup_instructions {
+        instructions.push(to_sdk_instruction(ix)?);
+    }
+
+    // 3. Token ledger — MUST come before BisonFi.
+    let token_ledger = swap_ixs
+        .token_ledger_instruction
+        .as_ref()
+        .context("missing tokenLedgerInstruction (useTokenLedger not honoured by Metis)")?;
+    instructions.push(to_sdk_instruction(token_ledger)?);
+
+    // 4. BisonFi leg.
+    instructions.push(to_sdk_instruction(bison_ix)?);
+
+    // 5. Jupiter route_with_token_ledger.
+    instructions.push(to_sdk_instruction(&swap_ixs.swap_instruction)?);
+
+    // 6. Cleanup.
+    if let Some(ix) = &swap_ixs.cleanup_instruction {
+        instructions.push(to_sdk_instruction(ix)?);
+    }
+
+    // 7. Jito tip (last).
+    #[allow(deprecated)]
+    instructions.push(system_instruction::transfer(
+        &payer.pubkey(),
+        tip_account,
+        tip_lamports,
+    ));
+
+    // Resolve ALTs: Metis-provided + any extra (BisonFi leg) tables.
+    let mut alt_pubkeys: Vec<Pubkey> = Vec::new();
+    for addr in &swap_ixs.address_lookup_table_addresses {
+        let pk = Pubkey::from_str(addr)?;
+        if !alt_pubkeys.contains(&pk) {
+            alt_pubkeys.push(pk);
+        }
+    }
+    for pk in extra_alts {
+        if !alt_pubkeys.contains(pk) {
+            alt_pubkeys.push(*pk);
+        }
+    }
+
+    let mut address_lookup_tables: Vec<AddressLookupTableAccount> = Vec::new();
+    for pk in &alt_pubkeys {
+        address_lookup_tables.push(resolve_alt(pk, alt_lookup, rpc_client)?);
+    }
+
+    let message = v0::Message::try_compile(
+        &payer.pubkey(),
+        &instructions,
+        &address_lookup_tables,
+        recent_blockhash,
+    )
+    .context("failed to compile v0 message")?;
+
+    let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[payer])
+        .context("failed to sign versioned transaction")?;
+    Ok(tx)
+}
+
+/// Pick a random Jito tip account that is not present in any of the given ALTs.
+pub fn pick_tip_account(alts: &[AddressLookupTableAccount]) -> Result<Pubkey> {
+    let tip_candidates: Vec<Pubkey> = JITO_TIP_ACCOUNTS
+        .iter()
+        .filter_map(|addr| Pubkey::from_str(addr).ok())
+        .filter(|tip| !alts.iter().any(|alt| alt.addresses.contains(tip)))
+        .collect();
+    let mut rng = rand::thread_rng();
+    tip_candidates
+        .choose(&mut rng)
+        .copied()
+        .context("all Jito tip accounts are present in route ALTs")
+}
+
 /// Number of distinct accounts the transaction locks.
 pub fn account_lock_count(tx: &VersionedTransaction) -> usize {
     match &tx.message {

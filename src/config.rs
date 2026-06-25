@@ -15,6 +15,8 @@ pub struct Config {
     pub yellowstone_grpc: YellowstoneGrpcConfig,
     #[serde(default)]
     pub pmm_sim: PmmSimConfig,
+    #[serde(default)]
+    pub bison_test: BisonTestConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -314,6 +316,76 @@ impl Default for PmmSimConfig {
             rpc_bootstrap: false,
             rpc_bootstrap_batch_size: default_rpc_bootstrap_batch_size(),
             programs: Vec::new(),
+        }
+    }
+}
+
+/// First-test ("BisonFi single-pool") mode.
+///
+/// When `enabled`, the normal multi-token scanner is fully disabled and the bot
+/// runs ONE fixed flow, re-triggered live on every Yellowstone update of the
+/// configured BisonFi pool accounts:
+///
+///   1. pmm-sim simulates BisonFi `WSOL -> USDC` for a fixed `amount_in_lamports`
+///      and returns both the predicted USDC out AND a ready DFlow `swap2`
+///      (spoof-Magnus) instruction for that leg.
+///   2. Metis quotes the return `USDC -> WSOL` (instructionVersion=V2, slippage 0)
+///      using the predicted USDC as the input amount.
+///   3. Profitability: `quote.outAmount >= amount_in + trading.min_profit_lamports`.
+///   4. If profitable, Metis `/swap-instructions` is fetched with
+///      `useTokenLedger=true`; the bundle is assembled as
+///      computeBudget → setup → tokenLedger → BisonFi → swap(route_with_token_ledger)
+///      → cleanup → Jito tip, and sent to Jito.
+#[derive(Debug, Deserialize, Clone)]
+pub struct BisonTestConfig {
+    /// Master switch. When true the scanner loop is skipped entirely.
+    #[serde(default)]
+    pub enabled: bool,
+    /// BisonFi market (pool) account, e.g. 8FnX…zLo.
+    #[serde(default)]
+    pub market: String,
+    /// Pool's WSOL vault token account (base leg). Live state comes from Yellowstone.
+    #[serde(default)]
+    pub base_ta: String,
+    /// Pool's USDC vault token account (quote leg). Live state comes from Yellowstone.
+    #[serde(default)]
+    pub quote_ta: String,
+    /// Address Lookup Table for the BisonFi leg accounts (optional but recommended).
+    #[serde(default)]
+    pub alt: String,
+    /// Fixed input for the first test: 0.04 SOL = 40_000_000 lamports.
+    #[serde(default = "default_bison_amount_in")]
+    pub amount_in_lamports: u64,
+    /// Jito tip transfer appended as the last instruction (test value: 1600).
+    #[serde(default = "default_bison_jito_tip")]
+    pub jito_tip_lamports: u64,
+    /// Standard network fee assumed for the break-even floor (test value: 5000).
+    #[serde(default = "default_bison_network_fee")]
+    pub network_fee_lamports: u64,
+    /// When true, stop after simulating the BisonFi price (log it) — do NOT call
+    /// Metis, build a token-ledger bundle, or send to Jito. Price-only mode for
+    /// validating the BisonFi WSOL->USDC (spoof=dflow) simulation in isolation.
+    #[serde(default = "default_bison_price_only")]
+    pub price_only: bool,
+}
+
+fn default_bison_amount_in() -> u64 { 40_000_000 }
+fn default_bison_jito_tip() -> u64 { 1_600 }
+fn default_bison_network_fee() -> u64 { 5_000 }
+fn default_bison_price_only() -> bool { true }
+
+impl Default for BisonTestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            market: String::new(),
+            base_ta: String::new(),
+            quote_ta: String::new(),
+            alt: String::new(),
+            amount_in_lamports: default_bison_amount_in(),
+            jito_tip_lamports: default_bison_jito_tip(),
+            network_fee_lamports: default_bison_network_fee(),
+            price_only: default_bison_price_only(),
         }
     }
 }

@@ -4,7 +4,11 @@ use tracing::{debug, info};
 use tracing_subscriber::{EnvFilter, fmt::time::UtcTime};
 
 fn main() -> eyre::Result<()> {
+    // CRITICAL: log to STDERR, not stdout. In `serve` mode the bot reads this
+    // process's STDOUT as a newline-delimited JSON IPC channel; any tracing line
+    // on stdout corrupts the protocol and the bot fails to parse responses.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_thread_ids(true)
         .with_line_number(true)
         .with_target(true)

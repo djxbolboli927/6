@@ -46,6 +46,12 @@ pub struct SwapInstructionsRequest {
     pub dynamic_compute_unit_limit: bool,
     pub skip_user_accounts_rpc_calls: bool,
     pub as_legacy_transaction: bool,
+    /// When true, Metis returns a `tokenLedgerInstruction` and a
+    /// `route_with_token_ledger` swap instruction instead of a plain `route_v2`.
+    /// The swap then consumes the *actual* token-account balance delta at runtime
+    /// rather than the quoted input amount — required for the BisonFi→Jupiter leg
+    /// where the real USDC produced by BisonFi may differ slightly from simulation.
+    pub use_token_ledger: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -55,6 +61,10 @@ pub struct SwapInstructionsResponse {
     pub compute_budget_instructions: Vec<InstructionData>,
     #[serde(default)]
     pub setup_instructions: Vec<InstructionData>,
+    /// Present only when the request set `useTokenLedger=true`. Must execute
+    /// BEFORE the BisonFi instruction so it snapshots the USDC balance.
+    #[serde(default)]
+    pub token_ledger_instruction: Option<InstructionData>,
     pub swap_instruction: InstructionData,
     #[serde(default)]
     pub cleanup_instruction: Option<InstructionData>,
@@ -236,6 +246,28 @@ impl MetisClient {
         user_pubkey: &str,
         quote_response: &QuoteResponse,
     ) -> std::result::Result<SwapInstructionsResponse, SwapIxError> {
+        self.get_swap_instructions_inner(user_pubkey, quote_response, false)
+            .await
+    }
+
+    /// Same as `get_swap_instructions` but requests `useTokenLedger=true` so the
+    /// returned swap is a `route_with_token_ledger` and a `tokenLedgerInstruction`
+    /// is included. Used by the BisonFi single-pool test flow.
+    pub async fn get_swap_instructions_token_ledger(
+        &self,
+        user_pubkey: &str,
+        quote_response: &QuoteResponse,
+    ) -> std::result::Result<SwapInstructionsResponse, SwapIxError> {
+        self.get_swap_instructions_inner(user_pubkey, quote_response, true)
+            .await
+    }
+
+    async fn get_swap_instructions_inner(
+        &self,
+        user_pubkey: &str,
+        quote_response: &QuoteResponse,
+        use_token_ledger: bool,
+    ) -> std::result::Result<SwapInstructionsResponse, SwapIxError> {
         let quote_value = match serde_json::to_value(quote_response) {
             Ok(v) => v,
             Err(_) => return Err(SwapIxError::Parse),
@@ -249,6 +281,7 @@ impl MetisClient {
             dynamic_compute_unit_limit: false,
             skip_user_accounts_rpc_calls: true,
             as_legacy_transaction: false,
+            use_token_ledger,
         };
 
         let url = format!("{}/swap-instructions", self.base_url);

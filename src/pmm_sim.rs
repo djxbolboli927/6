@@ -38,6 +38,10 @@ pub struct CachedAccount {
     pub owner: [u8; 32],
     pub executable: bool,
     pub rent_epoch: u64,
+    /// Chain slot this state belongs to (Yellowstone update slot / RPC context
+    /// slot / disk-snapshot slot). Used to warp the LiteSVM clock so
+    /// slot-sensitive PMMs accept the snapshot.
+    pub slot: u64,
 }
 
 /// Thread-safe map from base58 pubkey string → account state.
@@ -105,6 +109,63 @@ pub struct PmmSimResponse {
     pub error: Option<String>,
 }
 
+// ── BisonFi build+quote IPC (first-test mode) ─────────────────────────────────
+//
+// Distinct from the full-tx simulation path: this asks pmm-sim to BUILD a DFlow
+// `swap2` (spoof-Magnus) instruction for a single BisonFi leg and simulate it,
+// returning BOTH the predicted output AND the ready-to-send instruction.
+
+/// Request to build + simulate a single BisonFi `WSOL -> USDC` leg.
+#[derive(Serialize)]
+pub struct BuildBisonRequest {
+    /// Discriminates this op from the full-sim path. Always "build_bison".
+    pub op: &'static str,
+    pub id: u64,
+    /// Real trading wallet — the returned instruction references its real ATAs.
+    pub fee_payer: String,
+    /// BisonFi market (pool) account.
+    pub market: String,
+    pub src_mint: String,
+    pub dst_mint: String,
+    pub amount_in: u64,
+    /// Chain slot the account snapshot belongs to (warps the sim clock).
+    pub slot: u64,
+    /// Call BisonFi directly (no Magnus/DFlow spoof router) for the price.
+    pub direct: bool,
+    /// Fresh pool account state (market + both vaults) from the Yellowstone cache.
+    pub accounts: Vec<IpcAccount>,
+}
+
+/// One account meta of a built instruction (mirrors Metis `AccountMeta`).
+#[derive(Deserialize, Debug, Clone)]
+pub struct IpcInstructionAccount {
+    pub pubkey: String,
+    pub is_signer: bool,
+    pub is_writable: bool,
+}
+
+/// A fully-built instruction returned by pmm-sim (base64 data, real accounts).
+#[derive(Deserialize, Debug, Clone)]
+pub struct IpcInstructionOut {
+    pub program_id: String,
+    pub accounts: Vec<IpcInstructionAccount>,
+    pub data: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct BuildBisonResponse {
+    #[allow(dead_code)]
+    pub id: u64,
+    pub success: bool,
+    /// Predicted USDC out (raw units) for the simulated BisonFi leg.
+    pub amount_out: Option<u64>,
+    #[allow(dead_code)]
+    pub compute_units: Option<u64>,
+    /// The DFlow swap2 (spoof-Magnus) instruction to splice into the bundle.
+    pub instruction: Option<IpcInstructionOut>,
+    pub error: Option<String>,
+}
+
 // ── Subprocess handle ─────────────────────────────────────────────────────────
 
 struct SubprocessHandle {
@@ -144,7 +205,17 @@ impl PmmSimEngine {
                 eprintln!("[pmm_sim] subprocess started (binary={})", self.cfg.binary);
             }
             Err(e) => {
-                error!("[pmm_sim] failed to spawn subprocess: {e}");
+                let cwd = std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "?".to_string());
+                let resolved = std::path::Path::new(&self.cfg.binary)
+                    .canonicalize()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "<does not exist>".to_string());
+                error!(
+                    "[pmm_sim] failed to spawn subprocess: {e} | binary='{}' resolved='{resolved}' cwd='{cwd}' setup_path='{}' programs_path='{}' — check that this executable exists and is built (cd pmm-sim && cargo build --release)",
+                    self.cfg.binary, self.cfg.setup_path, self.cfg.programs_path,
+                );
             }
         }
     }
@@ -174,6 +245,41 @@ impl PmmSimEngine {
         &self,
         request: &FullSimRequest,
     ) -> Option<PmmSimResponse> {
+        let line = self.roundtrip(request).await?;
+        match serde_json::from_str::<PmmSimResponse>(line.trim()) {
+            Ok(resp) => Some(resp),
+            Err(e) => {
+                warn!("[pmm_sim] failed to parse response: {e} line={line:?}");
+                *self.handle.lock().await = None;
+                None
+            }
+        }
+    }
+
+    /// Whether the subprocess handle is currently live (spawned and not torn down).
+    pub async fn is_running(&self) -> bool {
+        self.handle.lock().await.is_some()
+    }
+
+    /// Build + simulate a single BisonFi `WSOL -> USDC` leg.
+    pub async fn build_bison(
+        &self,
+        request: &BuildBisonRequest,
+    ) -> Option<BuildBisonResponse> {
+        let line = self.roundtrip(request).await?;
+        match serde_json::from_str::<BuildBisonResponse>(line.trim()) {
+            Ok(resp) => Some(resp),
+            Err(e) => {
+                warn!("[pmm_sim] failed to parse build_bison response: {e} line={line:?}");
+                *self.handle.lock().await = None;
+                None
+            }
+        }
+    }
+
+    /// Serialize `request` to one JSON line, write it to the subprocess, and
+    /// return the raw response line. Closes the handle on any IO/timeout error.
+    async fn roundtrip<T: serde::Serialize>(&self, request: &T) -> Option<String> {
         let mut guard = self.handle.lock().await;
         let handle = guard.as_mut()?;
 
@@ -193,17 +299,7 @@ impl PmmSimEngine {
         .await;
 
         match result {
-            Ok(Ok(resp_line)) if !resp_line.trim().is_empty() => {
-                match serde_json::from_str::<PmmSimResponse>(resp_line.trim()) {
-                    Ok(resp) => Some(resp),
-                    Err(e) => {
-                        warn!("[pmm_sim] failed to parse response: {e} line={resp_line:?}");
-                        // Subprocess may be in a bad state; close the handle.
-                        *guard = None;
-                        None
-                    }
-                }
-            }
+            Ok(Ok(resp_line)) if !resp_line.trim().is_empty() => Some(resp_line),
             Ok(Ok(_)) => {
                 warn!("[pmm_sim] empty response from subprocess");
                 *guard = None;
@@ -215,7 +311,7 @@ impl PmmSimEngine {
                 None
             }
             Err(_) => {
-                warn!("[pmm_sim] simulation timed out after {}ms", self.timeout.as_millis());
+                warn!("[pmm_sim] request timed out after {}ms", self.timeout.as_millis());
                 *guard = None;
                 None
             }
@@ -239,6 +335,16 @@ use tonic::{
     Request,
 };
 
+/// Optional live-update trigger: when a watched account whose pubkey is in
+/// `keys` updates, `notify` is signalled. Used by the BisonFi test flow to react
+/// the instant the pool state changes (rather than polling on a timer).
+#[derive(Clone)]
+pub struct UpdateTrigger {
+    pub keys: Arc<std::collections::HashSet<String>>,
+    pub notify: Arc<tokio::sync::Notify>,
+    pub metrics: Arc<crate::bison_metrics::BisonMetrics>,
+}
+
 /// Spawn a background task that subscribes to Yellowstone gRPC and keeps the
 /// account cache up to date. On disconnect the task reconnects automatically.
 pub fn spawn_yellowstone_subscription(
@@ -246,10 +352,14 @@ pub fn spawn_yellowstone_subscription(
     x_token: String,
     watchlist: Vec<String>,
     cache: AccountCache,
+    trigger: Option<UpdateTrigger>,
 ) {
     tokio::spawn(async move {
         loop {
-            if let Err(e) = run_subscription(&endpoint, &x_token, &watchlist, cache.clone()).await {
+            if let Err(e) =
+                run_subscription(&endpoint, &x_token, &watchlist, cache.clone(), trigger.as_ref())
+                    .await
+            {
                 warn!("[yellowstone] subscription error: {e} — reconnecting in 2s");
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -262,11 +372,18 @@ async fn run_subscription(
     x_token: &str,
     watchlist: &[String],
     cache: AccountCache,
+    trigger: Option<&UpdateTrigger>,
 ) -> anyhow::Result<()> {
     let channel = Channel::from_shared(endpoint.to_string())?
         .tls_config(tonic::transport::ClientTlsConfig::new().with_enabled_roots())?
+        // Keep the HTTP/2 connection alive even when idle so the server does not
+        // drop a long-lived account subscription.
+        .http2_keep_alive_interval(Duration::from_secs(10))
+        .keep_alive_timeout(Duration::from_secs(20))
+        .keep_alive_while_idle(true)
         .connect()
         .await?;
+    eprintln!("[yellowstone] connected endpoint={endpoint} watchlist={}", watchlist.len());
 
     let token_meta = x_token.to_string();
     let mut client = GeyserClient::with_interceptor(channel, move |mut req: Request<()>| {
@@ -299,14 +416,44 @@ async fn run_subscription(
         ..Default::default()
     };
 
-    let stream_req = tokio_stream::once(sub_request);
+    // CRITICAL: keep the request stream OPEN. Using `tokio_stream::once` closes
+    // the client side immediately, and many geyser servers then stop sending
+    // updates. We hold the channel `tx` for the lifetime of the loop (sending
+    // the initial request, then periodic re-sends as keepalive) so the server
+    // keeps the subscription active.
+    let (tx, rx) = tokio::sync::mpsc::channel::<SubscribeRequest>(4);
+    tx.send(sub_request.clone()).await.ok();
+    let keepalive = sub_request.clone();
+    let tx_keep = tx.clone();
+    let keepalive_task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            // Re-asserting the same request keeps the stream open and the
+            // subscription fresh without changing filters.
+            if tx_keep.send(keepalive.clone()).await.is_err() {
+                break;
+            }
+        }
+    });
+    let stream_req = tokio_stream::wrappers::ReceiverStream::new(rx);
     let mut stream = client.subscribe(stream_req).await?.into_inner();
 
     use futures::StreamExt;
 
+    let mut total_updates: u64 = 0;
+    let mut logged_first = false;
     while let Some(msg) = stream.next().await {
         match msg {
             Ok(SubscribeUpdate { update_oneof: Some(proto::subscribe_update::UpdateOneof::Account(acc_update)), .. }) => {
+                let slot = acc_update.slot;
+                total_updates += 1;
+                if let Some(t) = trigger {
+                    t.metrics.grpc_total_updates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                if !logged_first {
+                    logged_first = true;
+                    eprintln!("[yellowstone] first account update received (slot={slot})");
+                }
                 if let Some(info) = acc_update.account {
                     if info.pubkey.len() == 32 {
                         let pubkey = bs58::encode(&info.pubkey).into_string();
@@ -316,9 +463,17 @@ async fn run_subscription(
                             owner: info.owner.as_slice().try_into().unwrap_or([0u8; 32]),
                             executable: info.executable,
                             rent_epoch: info.rent_epoch,
+                            slot,
                         };
                         if let Ok(mut w) = cache.write() {
-                            w.insert(pubkey, cached);
+                            w.insert(pubkey.clone(), cached);
+                        }
+                        // Fire the live-update trigger if this account is watched.
+                        if let Some(t) = trigger {
+                            if t.keys.contains(&pubkey) {
+                                t.metrics.record_pool_update();
+                                t.notify.notify_one();
+                            }
                         }
                     }
                 }
@@ -330,6 +485,9 @@ async fn run_subscription(
             }
         }
     }
+    keepalive_task.abort();
+    drop(tx);
+    warn!("[yellowstone] subscription stream ended (received {total_updates} account updates this session) — will reconnect");
     Ok(())
 }
 
@@ -362,6 +520,56 @@ pub fn collect_all_instruction_accounts(
     result
 }
 
+/// Read a cached account's raw data bytes (e.g. to parse a market account).
+pub fn get_cached_data(cache: &AccountCache, pubkey: &str) -> Option<Vec<u8>> {
+    cache.read().ok()?.get(pubkey).map(|a| a.data.clone())
+}
+
+/// Derive a BisonFi market's REAL base/quote vault token accounts from its
+/// market account data. Layout: magic "POOLSTAT", base_ta@120, quote_ta@152.
+/// Returns base58 (base_ta, quote_ta). Authoritative — does not trust mix.json.
+pub fn parse_bisonfi_vaults(market_data: &[u8]) -> Option<(String, String)> {
+    if market_data.len() < 248 || &market_data[0..8] != b"POOLSTAT" {
+        return None;
+    }
+    let base = bs58::encode(&market_data[120..152]).into_string();
+    let quote = bs58::encode(&market_data[152..184]).into_string();
+    Some((base, quote))
+}
+
+/// Collect `IpcAccount`s for an explicit list of pubkeys from the cache.
+/// Returns only the ones currently present; missing pubkeys are reported via
+/// the second element so the caller can decide whether state is warm enough.
+pub fn collect_accounts_by_pubkey(
+    pubkeys: &[String],
+    cache: &AccountCache,
+) -> (Vec<IpcAccount>, Vec<String>, u64) {
+    let mut found = Vec::new();
+    let mut missing = Vec::new();
+    let mut max_slot = 0u64;
+    let r = match cache.read() {
+        Ok(r) => r,
+        Err(_) => return (found, pubkeys.to_vec(), 0),
+    };
+    for pk in pubkeys {
+        match r.get(pk) {
+            Some(acc) => {
+                max_slot = max_slot.max(acc.slot);
+                found.push(IpcAccount {
+                    pubkey: pk.clone(),
+                    lamports: acc.lamports,
+                    data: B64.encode(&acc.data),
+                    owner: bs58::encode(acc.owner).into_string(),
+                    executable: acc.executable,
+                    rent_epoch: acc.rent_epoch,
+                });
+            }
+            None => missing.push(pk.clone()),
+        }
+    }
+    (found, missing, max_slot)
+}
+
 /// Bootstrap account cache from RPC using batched getMultipleAccounts.
 pub fn bootstrap_from_rpc(
     watchlist: &[String],
@@ -369,6 +577,7 @@ pub fn bootstrap_from_rpc(
     rpc: &solana_client::rpc_client::RpcClient,
     batch_size: usize,
 ) {
+    use solana_sdk::commitment_config::CommitmentConfig;
     use solana_sdk::pubkey::Pubkey;
     let batch_size = batch_size.min(100).max(1);
     let mut total = 0usize;
@@ -377,10 +586,13 @@ pub fn bootstrap_from_rpc(
         let pubkeys: Vec<Pubkey> = chunk.iter()
             .filter_map(|s| s.parse().ok())
             .collect();
-        match rpc.get_multiple_accounts(&pubkeys) {
-            Ok(accounts) => {
+        // Use the *with_commitment* variant so we get the context slot the data
+        // belongs to — needed to warp the sim clock for slot-sensitive PMMs.
+        match rpc.get_multiple_accounts_with_commitment(&pubkeys, CommitmentConfig::processed()) {
+            Ok(resp) => {
+                let slot = resp.context.slot;
                 let mut w = match cache.write() { Ok(w) => w, Err(_) => continue };
-                for (pk, maybe_acc) in pubkeys.iter().zip(accounts.iter()) {
+                for (pk, maybe_acc) in pubkeys.iter().zip(resp.value.iter()) {
                     if let Some(acc) = maybe_acc {
                         w.insert(pk.to_string(), CachedAccount {
                             lamports: acc.lamports,
@@ -388,6 +600,7 @@ pub fn bootstrap_from_rpc(
                             owner: acc.owner.to_bytes(),
                             executable: acc.executable,
                             rent_epoch: acc.rent_epoch,
+                            slot,
                         });
                         total += 1;
                     }
@@ -451,10 +664,11 @@ pub fn preload_cache_from_disk(accounts_path: &str, cache: &AccountCache) {
                 let owner: [u8; 32] = owner_bytes.try_into().unwrap_or([0u8; 32]);
                 let executable = v["account"]["executable"].as_bool().unwrap_or(false);
                 let rent_epoch = v["account"]["rentEpoch"].as_u64().unwrap_or(u64::MAX);
+                let slot = v["slot"].as_u64().unwrap_or(0);
 
                 if !pubkey.is_empty() {
                     if let Ok(mut w) = cache.write() {
-                        w.insert(pubkey, CachedAccount { lamports, data, owner, executable, rent_epoch });
+                        w.insert(pubkey, CachedAccount { lamports, data, owner, executable, rent_epoch, slot });
                         loaded += 1;
                     }
                 }
