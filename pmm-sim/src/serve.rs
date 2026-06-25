@@ -466,6 +466,22 @@ fn process_build_bison(
         data: real_ix.data.clone(),
     };
 
+    // Full instruction dump BEFORE simulation (so we can compare against the
+    // real DFlow instruction as ground truth, even when the sim fails).
+    dump_ix("REAL", &real_ix);
+    dump_ix("SIM ", &sim_ix);
+
+    // Build the out_ix once so we can return it on BOTH success and failure.
+    let out_ix = OutInstruction {
+        program_id: real_ix.program_id.to_string(),
+        accounts: real_ix.accounts.iter().map(|a| OutAccountMeta {
+            pubkey: a.pubkey.to_string(),
+            is_signer: a.is_signer,
+            is_writable: a.is_writable,
+        }).collect(),
+        data: B64.encode(&real_ix.data),
+    };
+
     let initial_dst = token_balance_from_svm(svm, &sim_dst_ta);
     let tx = Transaction::new_signed_with_payer(
         &[sim_ix],
@@ -479,18 +495,9 @@ fn process_build_bison(
             let final_dst = token_balance_from_svm(svm, &sim_dst_ta);
             let amount_out = final_dst.checked_sub(initial_dst);
             eprintln!(
-                "[pmm-sim build_bison] OK market={} amount_in={} amount_out_usdc={} spoof=dflow slot={} cu={}",
-                req.market, req.amount_in, amount_out.unwrap_or(0), req.slot, meta.compute_units_consumed,
+                "[pmm-sim build_bison] OK market={} amount_in={} amount_out_usdc={} direct={} slot={} cu={}",
+                req.market, req.amount_in, amount_out.unwrap_or(0), req.direct, req.slot, meta.compute_units_consumed,
             );
-            let out_ix = OutInstruction {
-                program_id: real_ix.program_id.to_string(),
-                accounts: real_ix.accounts.iter().map(|a| OutAccountMeta {
-                    pubkey: a.pubkey.to_string(),
-                    is_signer: a.is_signer,
-                    is_writable: a.is_writable,
-                }).collect(),
-                data: B64.encode(&real_ix.data),
-            };
             Ok(BuildBisonResponse {
                 id: req.id,
                 success: true,
@@ -510,11 +517,30 @@ fn process_build_bison(
                 success: false,
                 amount_out: None,
                 compute_units: Some(failed.meta.compute_units_consumed),
-                instruction: None,
+                // Return the instruction even on failure for debugging.
+                instruction: Some(out_ix),
                 error: Some(format!("{:?} | logs: {}", failed.err, logs)),
             })
         }
     }
+}
+
+/// Log a full instruction: program id, every account (pubkey/signer/writable in
+/// exact order), and the data as byte array + base64 + length.
+fn dump_ix(tag: &str, ix: &Instruction) {
+    eprintln!("[ix_dump {tag}] program_id={}", ix.program_id);
+    for (i, a) in ix.accounts.iter().enumerate() {
+        eprintln!(
+            "[ix_dump {tag}]   [{i}] {} signer={} writable={}",
+            a.pubkey, a.is_signer, a.is_writable
+        );
+    }
+    eprintln!(
+        "[ix_dump {tag}] data_len={} data_b64={} data_bytes={:?}",
+        ix.data.len(),
+        B64.encode(&ix.data),
+        ix.data
+    );
 }
 
 // ── SVM initialisation ────────────────────────────────────────────────────────
